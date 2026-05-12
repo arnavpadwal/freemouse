@@ -1,8 +1,6 @@
-# 🖱️ Freemouse
+# <img src="FreeMouse.png" width="28"> Freemouse
 
 > **Cross-platform mouse, keyboard, and clipboard sharing — encrypted, self-hosted, and free.**
-
-![Freemouse](FreeMouse.png)
 
 Freemouse lets you control multiple computers from a single mouse and keyboard over your local network. Move your cursor to the edge of the screen and it seamlessly jumps to the next machine — like a software KVM switch. All traffic is end-to-end encrypted.
 
