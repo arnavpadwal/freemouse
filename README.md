@@ -12,11 +12,11 @@
 
 Grab the latest binary from the [releases page](https://github.com/arnavpadwal/freemouse/releases).
 
-| Platform | File |
-|----------|------|
+| Platform          | File                                |
+| ----------------- | ----------------------------------- |
 | 🐧 Linux (x86-64) | `FreeMouse-v{VERSION}-x86_64-linux` |
-| 🪟 Windows | *(coming soon)* |
-| 🍎 macOS | *(coming soon)* |
+| 🪟 Windows        | _(coming soon)_                     |
+| 🍎 macOS          | _(coming soon)_                     |
 
 Or build from source (3-5 minutes):
 
@@ -47,12 +47,12 @@ cargo run --release
 
 ### Prerequisites
 
-| Platform | Dependency |
-|----------|-----------|
-| All | [Rust 1.75+](https://rustup.rs/) |
-| 🪟 Windows | Visual Studio Build Tools or MSVC |
-| 🍎 macOS | `xcode-select --install` |
-| 🐧 Linux | `build-essential` (Debian) / `base-devel` (Arch) |
+| Platform   | Dependency                                       |
+| ---------- | ------------------------------------------------ |
+| All        | [Rust 1.75+](https://rustup.rs/)                 |
+| 🪟 Windows | Visual Studio Build Tools or MSVC                |
+| 🍎 macOS   | `xcode-select --install`                         |
+| 🐧 Linux   | `build-essential` (Debian) / `base-devel` (Arch) |
 
 ### Build & Run
 
@@ -99,12 +99,12 @@ sudo usermod -a -G uinput $USER
 
 ## 🔒 Security
 
-| Component | Algorithm |
-|-----------|-----------|
-| **Key derivation** | Argon2id (memory-hard, PIN → 256-bit key) |
-| **Encryption** | ChaCha20Poly1305 (authenticated AEAD) |
-| **Per-message nonce** | Random 96-bit nonce per frame |
-| **PIN space** | 6 digits (~1M combinations) |
+| Component             | Algorithm                                 |
+| --------------------- | ----------------------------------------- |
+| **Key derivation**    | Argon2id (memory-hard, PIN → 256-bit key) |
+| **Encryption**        | ChaCha20Poly1305 (authenticated AEAD)     |
+| **Per-message nonce** | Random 96-bit nonce per frame             |
+| **PIN space**         | 6 digits (~1M combinations)               |
 
 The salt is exchanged in plaintext during the handshake. All subsequent traffic is encrypted and authenticated.
 
@@ -125,12 +125,12 @@ The salt is exchanged in plaintext during the handshake. All subsequent traffic 
 
 ### Modules
 
-| File | Role |
-|------|------|
-| `src/main.rs` | GUI, app state, mode management (egui/eframe) |
-| `src/network.rs` | TCP server/client, encryption, protocol, discovery (tokio) |
-| `src/capture.rs` | Input capture + simulation (evdev on Linux, rdev/enigo on Win/macOS) |
-| `src/clipboard.rs` | Clipboard polling with echo prevention (arboard) |
+| File               | Role                                                                 |
+| ------------------ | -------------------------------------------------------------------- |
+| `src/main.rs`      | GUI, app state, mode management (egui/eframe)                        |
+| `src/network.rs`   | TCP server/client, encryption, protocol, discovery (tokio)           |
+| `src/capture.rs`   | Input capture + simulation (evdev on Linux, rdev/enigo on Win/macOS) |
+| `src/clipboard.rs` | Clipboard polling with echo prevention (arboard)                     |
 
 ### Wire Protocol
 
