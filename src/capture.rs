@@ -391,8 +391,6 @@ pub mod os {
             RdevButton::Left => MouseButton::Left,
             RdevButton::Right => MouseButton::Right,
             RdevButton::Middle => MouseButton::Middle,
-            RdevButton::X1 => MouseButton::X1,
-            RdevButton::X2 => MouseButton::X2,
             RdevButton::Unknown(_) => MouseButton::Left,
         }
     }
@@ -535,9 +533,9 @@ pub mod os {
 
             // Other named keys
             KeyCode::PrintScreen => Some(EnigoKey::Print),
-            KeyCode::ScrollLock => Some(EnigoKey::ScrollLock),
+            KeyCode::ScrollLock => Some(EnigoKey::Other(71)),
             KeyCode::Pause => Some(EnigoKey::Pause),
-            KeyCode::Menu => Some(EnigoKey::Menu),
+            KeyCode::Menu => Some(EnigoKey::LMenu),
 
             // Direct Unicode passthrough
             KeyCode::Unicode(c) => Some(EnigoKey::Unicode(*c)),
