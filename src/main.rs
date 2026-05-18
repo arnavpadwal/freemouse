@@ -5,7 +5,7 @@ mod capture;
 mod clipboard;
 mod network;
 
-use eframe::egui;
+use eframe::egui::{self, ColorImage, TextureHandle};
 use rand::Rng;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -13,13 +13,144 @@ use tokio::sync::mpsc;
 
 #[derive(PartialEq, Clone)]
 enum AppMode {
+    Onboarding,
     Home,
     Share(String),
     Receive,
 }
 
+struct CheckResult {
+    name: &'static str,
+    pass: bool,
+    detail: String,
+}
+
+struct CheckResults {
+    checks: Vec<CheckResult>,
+}
+
+fn run_permission_checks() -> Vec<CheckResult> {
+    let mut checks = Vec::new();
+
+    // Check 1: evdev access on Linux
+    #[cfg(target_os = "linux")]
+    {
+        let input_dir = std::path::Path::new("/dev/input");
+        if !input_dir.exists() {
+            checks.push(CheckResult {
+                name: "Input devices",
+                pass: false,
+                detail: "/dev/input does not exist on this system.".into(),
+            });
+        } else {
+            let entries = std::fs::read_dir(input_dir);
+            match entries {
+                Ok(entries) => {
+                    let mut found_any = false;
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.file_name().and_then(|n| n.to_str()).unwrap_or("").starts_with("event") {
+                            found_any = true;
+                            match std::fs::metadata(&path) {
+                                Ok(_) => {
+                                    // Try opening for read
+                                    match std::fs::File::open(&path) {
+                                        Ok(_) => {
+                                            checks.push(CheckResult {
+                                                name: "Input devices",
+                                                pass: true,
+                                                detail: "evdev devices accessible.".into(),
+                                            });
+                                        }
+                                        Err(_) => {
+                                            checks.push(CheckResult {
+                                                name: "Input devices (Permissions)",
+                                                pass: false,
+                                                detail: format!(
+                                                    "Cannot read {:?}.\nRun: sudo usermod -aG input $USER\nThen log out and back in.",
+                                                    path
+                                                ),
+                                            });
+                                        }
+                                    }
+                                }
+                                Err(_) => {}
+                            }
+                            break;
+                        }
+                    }
+                    if !found_any {
+                        checks.push(CheckResult {
+                            name: "Input devices",
+                            pass: false,
+                            detail: "No event devices found in /dev/input.".into(),
+                        });
+                    }
+                }
+                Err(e) => {
+                    checks.push(CheckResult {
+                        name: "Input devices",
+                        pass: false,
+                        detail: format!("Cannot read /dev/input: {}", e),
+                    });
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        checks.push(CheckResult {
+            name: "Input devices",
+            pass: true,
+            detail: "Platform does not require evdev.".into(),
+        });
+    }
+
+    // Check 2: Port availability
+    {
+        match std::net::TcpListener::bind("0.0.0.0:4444") {
+            Ok(_) => {
+                checks.push(CheckResult {
+                    name: "Network port 4444",
+                    pass: true,
+                    detail: "Port 4444 is available.".into(),
+                });
+            }
+            Err(e) => {
+                checks.push(CheckResult {
+                    name: "Network port 4444",
+                    pass: false,
+                    detail: format!("Cannot bind port 4444: {}", e),
+                });
+            }
+        }
+    }
+
+    // Check 3: Screen size detected
+    {
+        let (w, h) = capture::get_screen_size();
+        if w > 0.0 && h > 0.0 {
+            checks.push(CheckResult {
+                name: "Display detected",
+                pass: true,
+                detail: format!("Screen: {:.0}x{:.0}", w, h),
+            });
+        } else {
+            checks.push(CheckResult {
+                name: "Display detected",
+                pass: false,
+                detail: "Could not detect screen size.".into(),
+            });
+        }
+    }
+
+    checks
+}
+
 struct FreemouseApp {
     mode: AppMode,
+    logo_texture: Option<TextureHandle>,
     ip_string: String,
     pin_string: String,
     connection_status: Arc<Mutex<String>>,
@@ -30,13 +161,17 @@ struct FreemouseApp {
     screen_width: f64,
     screen_height: f64,
     _discovery_rx: Option<mpsc::Receiver<network::DiscoveredServer>>,
+    permission_checks: CheckResults,
 }
 
 impl Default for FreemouseApp {
     fn default() -> Self {
         let (sw, sh) = capture::get_screen_size();
+        let checks = run_permission_checks();
+        let all_pass = checks.iter().all(|c| c.pass);
         Self {
-            mode: AppMode::Home,
+            mode: if all_pass { AppMode::Home } else { AppMode::Onboarding },
+            logo_texture: None,
             ip_string: String::new(),
             pin_string: String::new(),
             connection_status: Arc::new(Mutex::new("Ready".to_string())),
@@ -47,6 +182,7 @@ impl Default for FreemouseApp {
             screen_width: sw,
             screen_height: sh,
             _discovery_rx: None,
+            permission_checks: CheckResults { checks },
         }
     }
 }
@@ -81,6 +217,7 @@ impl eframe::App for FreemouseApp {
                 ui.add_space(10.0);
 
                 match self.mode.clone() {
+                    AppMode::Onboarding => { self.render_onboarding(ctx, ui); }
                     AppMode::Home => {
                         let btn_size = egui::vec2(220.0, 50.0);
                         if ui
@@ -317,6 +454,82 @@ impl eframe::App for FreemouseApp {
     }
 }
 
+impl FreemouseApp {
+    fn render_onboarding(&mut self, _ctx: &egui::Context, ui: &mut egui::Ui) {
+        ui.add_space(30.0);
+
+        // Logo
+        if let Some(tex) = &self.logo_texture {
+            ui.add(egui::Image::new(tex).max_height(128.0));
+            ui.add_space(10.0);
+        }
+
+        ui.heading(egui::RichText::new("Welcome to Freemouse").size(28.0).strong());
+        ui.label(egui::RichText::new("Mouse, Keyboard & Clipboard Sharing").size(14.0).weak());
+        ui.add_space(20.0);
+
+        // Permission checks
+        ui.label(egui::RichText::new("System Checks").size(18.0).strong());
+        ui.separator();
+        ui.add_space(10.0);
+
+        let all_pass = self.permission_checks.checks.iter().all(|c| c.pass);
+
+        for check in &self.permission_checks.checks {
+            ui.horizontal(|ui| {
+                let icon = if check.pass { "✓" } else { "✗" };
+                let color = if check.pass {
+                    egui::Color32::from_rgb(100, 220, 100)
+                } else {
+                    egui::Color32::from_rgb(240, 100, 100)
+                };
+                ui.label(egui::RichText::new(icon).size(18.0).color(color));
+                ui.label(egui::RichText::new(check.name).strong());
+            });
+
+            if !check.pass {
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(&check.detail)
+                        .size(11.0)
+                        .color(egui::Color32::GRAY),
+                );
+                ui.add_space(2.0);
+            }
+        }
+
+        ui.add_space(20.0);
+
+        if all_pass {
+            ui.label(
+                egui::RichText::new("All checks passed! You're ready to go.")
+                    .size(14.0)
+                    .color(egui::Color32::from_rgb(100, 220, 100)),
+            );
+            ui.add_space(15.0);
+            if ui
+                .add_sized(egui::vec2(120.0, 40.0), egui::Button::new("Let's go!"))
+                .clicked()
+            {
+                self.mode = AppMode::Home;
+            }
+        } else {
+            ui.label(
+                egui::RichText::new("Some checks failed. Please fix the issues above.")
+                    .size(14.0)
+                    .color(egui::Color32::from_rgb(240, 180, 60)),
+            );
+            ui.add_space(10.0);
+            if ui
+                .add_sized(egui::vec2(160.0, 40.0), egui::Button::new("Continue anyway"))
+                .clicked()
+            {
+                self.mode = AppMode::Home;
+            }
+        }
+    }
+}
+
 fn main() -> Result<(), eframe::Error> {
     tracing_subscriber::fmt::init();
 
@@ -340,7 +553,23 @@ fn main() -> Result<(), eframe::Error> {
             style.visuals.widgets.active.rounding = egui::Rounding::same(8.0);
             cc.egui_ctx.set_style(style);
 
-            Box::<FreemouseApp>::default()
+            let mut app = FreemouseApp::default();
+            // Load logo texture
+            let logo_bytes = include_bytes!("../FreeMouse.png");
+            if let Ok(img) = image::load_from_memory(logo_bytes) {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                let color_image = ColorImage::from_rgba_unmultiplied(
+                    [w as usize, h as usize],
+                    rgba.as_raw(),
+                );
+                app.logo_texture = Some(cc.egui_ctx.load_texture(
+                    "freemouse_logo",
+                    color_image,
+                    egui::TextureOptions::default(),
+                ));
+            }
+            Box::new(app)
         }),
     )
 }

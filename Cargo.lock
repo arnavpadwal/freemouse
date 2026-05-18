@@ -14,6 +14,7 @@ dependencies = [
  "enigo",
  "evdev",
  "hostname",
+ "image 0.25.10",
  "lazy_static",
  "local-ip-address",
  "rand",

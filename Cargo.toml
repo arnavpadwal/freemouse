@@ -23,6 +23,7 @@ tracing-subscriber = "0.3"
 lazy_static = "1.4"
 winresource = "0.1.31"
 hostname = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 rdev = { version = "0.5.3", features = ["unstable_grab"] }
