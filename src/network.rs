@@ -253,26 +253,42 @@ pub async fn start_server(
     port: u16,
     pin: &str,
 ) -> Result<Connection, Box<dyn std::error::Error + Send + Sync>> {
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-    // Accept with timeout
-    let (mut stream, _addr) = timeout(
-        Duration::from_secs(CONNECTION_TIMEOUT_SECS),
-        listener.accept(),
-    )
-    .await
-    .map_err(|_| "Connection timeout: no receiver connected")??;
+    let mut attempts = 0;
+    const MAX_ATTEMPTS: usize = 5;
+    
+    loop {
+        attempts += 1;
+        match TcpListener::bind(format!("0.0.0.0:{}", port)).await {
+            Ok(listener) => {
+                // Accept with timeout
+                let (mut stream, _addr) = timeout(
+                    Duration::from_secs(CONNECTION_TIMEOUT_SECS),
+                    listener.accept(),
+                )
+                .await
+                .map_err(|_| "Connection timeout: no receiver connected")??;
 
-    // Application-level keep-alive pings handle disconnect detection
-    // TCP keepalive not set here to keep cross-platform compatibility simple
+                // Application-level keep-alive pings handle disconnect detection
+                // TCP keepalive not set here to keep cross-platform compatibility simple
 
-    let mut salt = [0u8; 16];
-    rand::Rng::fill(&mut rand::thread_rng(), &mut salt);
-    stream.write_all(&salt).await?;
+                let mut salt = [0u8; 16];
+                rand::Rng::fill(&mut rand::thread_rng(), &mut salt);
+                stream.write_all(&salt).await?;
 
-    let key = derive_key(pin, &salt)?;
-    let cipher = ChaCha20Poly1305::new(&key);
+                let key = derive_key(pin, &salt)?;
+                let cipher = ChaCha20Poly1305::new(&key);
 
-    Ok(Connection { stream, cipher })
+                return Ok(Connection { stream, cipher });
+            }
+            Err(e) => {
+                if attempts >= MAX_ATTEMPTS {
+                    return Err(format!("Failed to bind to port {} after {} attempts: {}", port, MAX_ATTEMPTS, e).into());
+                }
+                tracing::warn!("Port {} bind attempt {}/{} failed: {}", port, attempts, MAX_ATTEMPTS, e);
+                tokio::time::sleep(Duration::from_millis(1000 * attempts as u64)).await;
+            }
+        }
+    }
 }
 
 /// Starts Receive mode (client). Connects to the given IP:port.
