@@ -90,7 +90,6 @@ impl eframe::App for FreemouseApp {
                             )
                             .clicked()
                         {
-                            self.server_task = None;
                             capture::os::stop_capture();
 
                             let pin = format!("{:06}", rand::thread_rng().gen_range(0..999999));
@@ -108,25 +107,19 @@ impl eframe::App for FreemouseApp {
                                 rt.block_on(network::start_discovery_broadcast(4444));
                             });
 
-                            eprintln!("[freemouse] Share button clicked, spawning server thread...");
                             self.server_task = Some(std::thread::spawn(move || {
-                                eprintln!("[freemouse] Server thread started, creating tokio runtime...");
                                 let rt = match tokio::runtime::Runtime::new() {
                                     Ok(rt) => rt,
                                     Err(e) => {
-                                        eprintln!("[freemouse] FAILED to create tokio runtime: {}", e);
                                         *status_clone.lock().unwrap() =
                                             format!("Runtime Error: {}", e);
                                         ctx_clone.request_repaint();
                                         return;
                                     }
                                 };
-                                eprintln!("[freemouse] Tokio runtime created, starting server...");
                                 rt.block_on(async {
-                                    eprintln!("[freemouse] Calling start_server on port 4444...");
                                     match network::start_server(4444, &pin_clone).await {
                                         Ok(conn) => {
-                                            eprintln!("[freemouse] Server started successfully, connected!");
                                             *status_clone.lock().unwrap() = "Connected!".to_string();
                                             ctx_clone.request_repaint();
 
@@ -143,14 +136,12 @@ impl eframe::App for FreemouseApp {
                                             ctx_clone.request_repaint();
                                         }
                                         Err(e) => {
-                                            eprintln!("[freemouse] Server error: {}", e);
                                             *status_clone.lock().unwrap() =
                                                 format!("Error: {}", e);
                                             ctx_clone.request_repaint();
                                         }
                                     }
                                 });
-                                eprintln!("[freemouse] Server thread exiting");
                             }));
                         }
                         ui.add_space(10.0);
@@ -266,7 +257,6 @@ impl eframe::App for FreemouseApp {
                             )
                             .clicked()
                         {
-                            self.client_task = None;
                             *self.connection_status.lock().unwrap() = "Connecting...".to_string();
                             let ip = self.ip_string.clone();
                             let pin = self.pin_string.clone();

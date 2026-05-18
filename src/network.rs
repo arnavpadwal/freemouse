@@ -258,30 +258,41 @@ pub async fn start_server(
     
     loop {
         attempts += 1;
-        eprintln!("[start_server] Attempt {}/{} to bind to port {}", attempts, MAX_ATTEMPTS, port);
         match tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await {
             Ok(listener) => {
-                eprintln!("[start_server] SUCCESS: bound to port {}, waiting for connection...", port);
+                tracing::info!("Server listening on port {}", port);
                 
-                // Accept with timeout
-                let (mut stream, _addr) = timeout(
-                    Duration::from_secs(CONNECTION_TIMEOUT_SECS),
-                    listener.accept(),
-                )
-                .await
-                .map_err(|_| "Connection timeout: no receiver connected")??;
+                loop {
+                    match listener.accept().await {
+                        Ok((mut stream, addr)) => {
+                            tracing::info!("Connection from {}", addr);
 
-                // Application-level keep-alive pings handle disconnect detection
-                // TCP keepalive not set here to keep cross-platform compatibility simple
+                            let mut salt = [0u8; 16];
+                            rand::Rng::fill(&mut rand::thread_rng(), &mut salt);
+                            
+                            if let Err(e) = stream.write_all(&salt).await {
+                                tracing::warn!("Failed to write salt: {}", e);
+                                continue;
+                            }
 
-                let mut salt = [0u8; 16];
-                rand::Rng::fill(&mut rand::thread_rng(), &mut salt);
-                stream.write_all(&salt).await?;
+                            let key = match derive_key(pin, &salt) {
+                                Ok(k) => k,
+                                Err(e) => {
+                                    tracing::warn!("Failed to derive key: {}", e);
+                                    continue;
+                                }
+                            };
+                            let cipher = ChaCha20Poly1305::new(&key);
 
-                let key = derive_key(pin, &salt)?;
-                let cipher = ChaCha20Poly1305::new(&key);
+                            return Ok(Connection { stream, cipher });
+                        }
+                        Err(e) => {
+                            tracing::warn!("Accept error: {}", e);
+                            tokio::time::sleep(Duration::from_millis(1000)).await;
+                        }
+                    }
+                }
 
-                return Ok(Connection { stream, cipher });
             }
             Err(e) => {
                 if attempts >= MAX_ATTEMPTS {
