@@ -365,6 +365,7 @@ pub async fn run_share_loop(conn: Connection, mut rx: mpsc::Receiver<NetworkEven
 
     // From network (receiver -> share): handle clipboard sync and keep-alive
     let net_read_handle = tokio::spawn(async move {
+        eprintln!("[network] share read task started");
         loop {
             tokio::select! {
                 result = recv_encrypted(&mut read_half, &cipher1) => {
@@ -375,21 +376,26 @@ pub async fn run_share_loop(conn: Connection, mut rx: mpsc::Receiver<NetworkEven
                                     crate::clipboard::set_clipboard_text(txt);
                                 }
                                 NetworkEvent::KeepAlive => {
-                                    // Peer is alive. No action needed.
+                                    eprintln!("[network] share received keepalive");
                                 }
                                 _ => {} // Ignore other events from receiver
                             }
                         }
-                        Err(_) => break,
+                        Err(e) => {
+                            eprintln!("[network] share read error: {:?}", e);
+                            break;
+                        }
                     }
                 }
                 _ = shutdown_rx.recv() => break,
             }
         }
+        eprintln!("[network] share read task exited");
     });
 
     // To network (share -> receiver): forward captured events with keep-alive
     let net_write_handle = tokio::spawn(async move {
+        eprintln!("[network] share write task started");
         let mut keepalive_interval =
             tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
         loop {
@@ -402,6 +408,7 @@ pub async fn run_share_loop(conn: Connection, mut rx: mpsc::Receiver<NetworkEven
                     }
                 }
                 _ = keepalive_interval.tick() => {
+                    eprintln!("[network] share sending keepalive");
                     if send_encrypted(&mut write_half, &cipher2, &NetworkEvent::KeepAlive).await.is_err() {
                         eprintln!("[network] share keepalive send error, breaking");
                         break;
@@ -409,13 +416,20 @@ pub async fn run_share_loop(conn: Connection, mut rx: mpsc::Receiver<NetworkEven
                 }
             }
         }
+        eprintln!("[network] share write task exited");
     });
 
+    eprintln!("[network] share loop waiting for tasks");
     // Wait for either task to finish (connection lost)
     tokio::select! {
-        _ = net_read_handle => {},
-        _ = net_write_handle => {},
+        _ = net_read_handle => {
+            eprintln!("[network] share read handle finished first");
+        },
+        _ = net_write_handle => {
+            eprintln!("[network] share write handle finished first");
+        },
     }
+    eprintln!("[network] share loop exited");
 }
 
 /// Runs the receive-side event loop: receives input events from the share machine
@@ -433,26 +447,32 @@ pub async fn run_receive_loop(conn: Connection, tx: mpsc::Sender<NetworkEvent>) 
 
     // To network (receiver -> share): send clipboard updates + keep-alive
     let net_write_handle = tokio::spawn(async move {
+        eprintln!("[network] receive write task started");
         let mut keepalive_interval =
             tokio::time::interval(Duration::from_secs(KEEPALIVE_INTERVAL_SECS));
         loop {
             tokio::select! {
                 Some(event) = clip_rx.recv() => {
                     if send_encrypted(&mut write_half, &cipher2, &event).await.is_err() {
+                        eprintln!("[network] receive clipboard send error, breaking");
                         break;
                     }
                 }
                 _ = keepalive_interval.tick() => {
+                    eprintln!("[network] receive sending keepalive");
                     if send_encrypted(&mut write_half, &cipher2, &NetworkEvent::KeepAlive).await.is_err() {
+                        eprintln!("[network] receive keepalive send error, breaking");
                         break;
                     }
                 }
             }
         }
+        eprintln!("[network] receive write task exited");
     });
 
     // From network (share -> receiver): forward mouse/keyboard events to simulation
     let net_read_handle = tokio::spawn(async move {
+        eprintln!("[network] receive read task started");
         loop {
             tokio::select! {
                 result = recv_encrypted(&mut read_half, &cipher1) => {
@@ -463,7 +483,7 @@ pub async fn run_receive_loop(conn: Connection, tx: mpsc::Sender<NetworkEvent>) 
                                     crate::clipboard::set_clipboard_text(txt.clone());
                                 }
                                 NetworkEvent::KeepAlive => {
-                                    // No action needed.
+                                    eprintln!("[network] receive got keepalive from share");
                                 }
                                 _ => {
                                     eprintln!("[network] receive forwarding: {:?}", event);
@@ -480,12 +500,19 @@ pub async fn run_receive_loop(conn: Connection, tx: mpsc::Sender<NetworkEvent>) 
                 _ = shutdown_rx.recv() => break,
             }
         }
+        eprintln!("[network] receive read task exited");
     });
 
+    eprintln!("[network] receive loop waiting for tasks");
     tokio::select! {
-        _ = net_read_handle => {},
-        _ = net_write_handle => {},
+        _ = net_read_handle => {
+            eprintln!("[network] receive read handle finished first");
+        },
+        _ = net_write_handle => {
+            eprintln!("[network] receive write handle finished first");
+        },
     }
+    eprintln!("[network] receive loop exited");
 }
 
 // ============================================================

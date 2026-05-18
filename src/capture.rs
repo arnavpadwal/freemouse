@@ -1259,19 +1259,28 @@ pub mod os {
                         }
                         let remote_now = is_remote.load(Ordering::SeqCst);
                         if remote_now {
-                            let _ = tx.blocking_send(NetworkEvent::MouseMoveRelative(value as f64, 0.0));
+                            match tx.blocking_send(NetworkEvent::MouseMoveRelative(value as f64, 0.0)) {
+                                Ok(()) => eprintln!("[capture] sent REL_X={}", value),
+                                Err(e) => eprintln!("[capture] REL_X send FAILED: {:?}", e),
+                            }
                         }
                     }
                     1 => {
                         let remote_now = is_remote.load(Ordering::SeqCst);
                         if remote_now {
-                            let _ = tx.blocking_send(NetworkEvent::MouseMoveRelative(0.0, value as f64));
+                            match tx.blocking_send(NetworkEvent::MouseMoveRelative(0.0, value as f64)) {
+                                Ok(()) => eprintln!("[capture] sent REL_Y={}", value),
+                                Err(e) => eprintln!("[capture] REL_Y send FAILED: {:?}", e),
+                            }
                         }
                     }
                     8 => {
                         let remote_now = is_remote.load(Ordering::SeqCst);
                         if remote_now {
-                            let _ = tx.blocking_send(NetworkEvent::MouseScroll(0, value));
+                            match tx.blocking_send(NetworkEvent::MouseScroll(0, value)) {
+                                Ok(()) => eprintln!("[capture] sent WHEEL={}", value),
+                                Err(e) => eprintln!("[capture] WHEEL send FAILED: {:?}", e),
+                            }
                         }
                     }
                     _ => {}
@@ -1293,13 +1302,19 @@ pub mod os {
                         }
                         let remote_now = is_remote.load(Ordering::SeqCst);
                         if remote_now {
-                            let _ = tx.blocking_send(NetworkEvent::MouseMoved(val, *last_abs_x));
+                            match tx.blocking_send(NetworkEvent::MouseMoved(val, *last_abs_x)) {
+                                Ok(()) => eprintln!("[capture] sent ABS_X={:.0}", val),
+                                Err(e) => eprintln!("[capture] ABS_X send FAILED: {:?}", e),
+                            }
                         }
                     }
                     1 => {
                         let remote_now = is_remote.load(Ordering::SeqCst);
                         if remote_now {
-                            let _ = tx.blocking_send(NetworkEvent::MouseMoved(*last_abs_x, val));
+                            match tx.blocking_send(NetworkEvent::MouseMoved(*last_abs_x, val)) {
+                                Ok(()) => eprintln!("[capture] sent ABS_Y={:.0}", val),
+                                Err(e) => eprintln!("[capture] ABS_Y send FAILED: {:?}", e),
+                            }
                         }
                     }
                     _ => {}
@@ -1314,10 +1329,18 @@ pub mod os {
                     if let Some(kc) = evdev_key_to_keycode(key) {
                         eprintln!("[capture] key {:?} pressed={}", kc, pressed);
                         if pressed {
-                            let _ = tx.blocking_send(NetworkEvent::KeyDown(kc));
+                            match tx.blocking_send(NetworkEvent::KeyDown(kc)) {
+                                Ok(()) => eprintln!("[capture] sent KeyDown"),
+                                Err(e) => eprintln!("[capture] KeyDown send FAILED: {:?}", e),
+                            }
                         } else {
-                            let _ = tx.blocking_send(NetworkEvent::KeyUp(kc));
+                            match tx.blocking_send(NetworkEvent::KeyUp(kc)) {
+                                Ok(()) => eprintln!("[capture] sent KeyUp"),
+                                Err(e) => eprintln!("[capture] KeyUp send FAILED: {:?}", e),
+                            }
                         }
+                    } else {
+                        eprintln!("[capture] key code {} unmapped", event.code());
                     }
                 }
             }
