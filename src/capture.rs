@@ -576,6 +576,20 @@ pub mod os {
         STOP_FLAG.store(true, Ordering::SeqCst);
     }
 
+    /// Manual toggle remote mode on/off.
+    /// Returns the new state.
+    pub fn toggle_remote() -> bool {
+        let new = !IS_REMOTE.load(Ordering::SeqCst);
+        IS_REMOTE.store(new, Ordering::SeqCst);
+        tracing::info!("Remote mode manually toggled to {}", if new { "ON" } else { "OFF" });
+        new
+    }
+
+    /// Returns current remote mode state.
+    pub fn is_remote() -> bool {
+        IS_REMOTE.load(Ordering::SeqCst)
+    }
+
     /// Enumerate evdev input devices for keyboards and mice.
     /// Opens them for passive input capture (no exclusive grab).
     fn find_input_devices() -> Vec<std::path::PathBuf> {
@@ -1160,11 +1174,20 @@ pub mod os {
                 return;
             }
 
-            let mut edge_detector = EdgeDetector::new(12);
+            let mut edge_detector = EdgeDetector::new(3);
             let edge_threshold = 5.0;
+            let mut last_abs_x = 0.0_f64;
+
+            tracing::info!(
+                "Capture started: {} device(s), threshold={}, edge_px={}",
+                opened_devices.len(),
+                3,
+                edge_threshold,
+            );
 
             loop {
                 if stop_flag.load(Ordering::SeqCst) {
+                    tracing::info!("Capture stopped");
                     break;
                 }
 
@@ -1179,12 +1202,13 @@ pub mod os {
                                     screen_width,
                                     &mut edge_detector,
                                     edge_threshold,
+                                    &mut last_abs_x,
                                 );
                             }
                         }
                         Err(e) => {
                             if e.kind() != std::io::ErrorKind::WouldBlock {
-                                tracing::debug!("evdev fetch error: {}", e);
+                                tracing::warn!("evdev fetch error: {}", e);
                             }
                             break;
                         }
@@ -1203,6 +1227,7 @@ pub mod os {
         screen_width: f64,
         edge: &mut EdgeDetector,
         edge_threshold: f64,
+        last_abs_x: &mut f64,
     ) {
         let currently_remote = is_remote.load(Ordering::SeqCst);
 
@@ -1215,19 +1240,14 @@ pub mod os {
                         if let Some(is_right) = edge.feed_rel_x(value) {
                             if is_right && !currently_remote {
                                 is_remote.store(true, Ordering::SeqCst);
-                                tracing::info!(
-                                    "Remote mode ON (sustained rightward movement)"
-                                );
+                                tracing::info!("Remote ON (REL right edge)");
                             } else if !is_right && currently_remote {
                                 is_remote.store(false, Ordering::SeqCst);
-                                tracing::info!(
-                                    "Remote mode OFF (sustained leftward movement)"
-                                );
+                                tracing::info!("Remote OFF (REL left edge)");
                             }
                         }
-                        // Forward absolute position estimate when remote
-                        if currently_remote {
-                            // Build an approximate x from cumulative delta
+                        let remote_now = is_remote.load(Ordering::SeqCst);
+                        if remote_now {
                             let _ = tx.blocking_send(NetworkEvent::MouseMoveRelative(
                                 value as f64, 0.0,
                             ));
@@ -1235,42 +1255,47 @@ pub mod os {
                     }
                     1 => {
                         // REL_Y
-                        if currently_remote {
+                        let remote_now = is_remote.load(Ordering::SeqCst);
+                        if remote_now {
                             let _ = tx.blocking_send(NetworkEvent::MouseMoveRelative(
                                 0.0, value as f64,
                             ));
                         }
                     }
-                    8 if currently_remote => {
-                        // REL_WHEEL
-                        let _ = tx.blocking_send(NetworkEvent::MouseScroll(0, value));
+                    8 => {
+                        let remote_now = is_remote.load(Ordering::SeqCst);
+                        if remote_now {
+                            let _ = tx.blocking_send(NetworkEvent::MouseScroll(0, value));
+                        }
                     }
                     _ => {}
                 }
             }
             EventType::ABSOLUTE => {
-                // Absolute devices (touchpads) give us the real position
-                // Use direct edge comparison
                 let val = event.value() as f64;
                 match event.code() {
                     0 => {
                         // ABS_X
+                        *last_abs_x = val;
                         if !currently_remote && val >= screen_width - edge_threshold {
                             is_remote.store(true, Ordering::SeqCst);
                             edge.reset();
-                            tracing::info!("Remote mode ON (ABS X at {:.0})", val);
+                            tracing::info!("Remote ON (ABS X {:.0})", val);
                         } else if currently_remote && val <= edge_threshold {
                             is_remote.store(false, Ordering::SeqCst);
                             edge.reset();
-                            tracing::info!("Remote mode OFF (ABS X at {:.0})", val);
-                        } else if currently_remote {
-                            let _ = tx.blocking_send(NetworkEvent::MouseMoved(val, 0.0));
+                            tracing::info!("Remote OFF (ABS X {:.0})", val);
+                        }
+                        let remote_now = is_remote.load(Ordering::SeqCst);
+                        if remote_now {
+                            let _ = tx.blocking_send(NetworkEvent::MouseMoved(val, *last_abs_x));
                         }
                     }
                     1 => {
-                        // ABS_Y — send with last known x
-                        if currently_remote {
-                            let _ = tx.blocking_send(NetworkEvent::MouseMoved(val, 0.0));
+                        // ABS_Y
+                        let remote_now = is_remote.load(Ordering::SeqCst);
+                        if remote_now {
+                            let _ = tx.blocking_send(NetworkEvent::MouseMoved(*last_abs_x, val));
                         }
                     }
                     _ => {}
@@ -1279,8 +1304,9 @@ pub mod os {
             EventType::KEY => {
                 let key = EvdevKey::new(event.code());
                 let pressed = event.value() != 0;
+                let remote_now = is_remote.load(Ordering::SeqCst);
 
-                if currently_remote {
+                if remote_now {
                     if let Some(kc) = evdev_key_to_keycode(key) {
                         if pressed {
                             let _ = tx.blocking_send(NetworkEvent::KeyDown(kc));

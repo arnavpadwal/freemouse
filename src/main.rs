@@ -525,12 +525,21 @@ impl FreemouseApp {
 
         ui.add_space(16.0);
 
-        // Status chip
-        if status.contains("Connected") {
-            badge(ui, theme, BadgeProps::new("Connected").variant(BadgeVariant::Default).color(ACCENT_GREEN));
-        } else {
-            badge(ui, theme, BadgeProps::new("Waiting for connection...").variant(BadgeVariant::Secondary));
-        }
+        // Status row: connection + remote mode
+        ui.horizontal(|ui| {
+            if status.contains("Connected") {
+                badge(ui, theme, BadgeProps::new("Connected").variant(BadgeVariant::Default).color(ACCENT_GREEN));
+                ui.add_space(8.0);
+                let remote = capture::os::is_remote();
+                if remote {
+                    badge(ui, theme, BadgeProps::new("REMOTE").variant(BadgeVariant::Default).color(ACCENT_PRIMARY));
+                } else {
+                    badge(ui, theme, BadgeProps::new("Local").variant(BadgeVariant::Outline).color(TEXT_MUTED));
+                }
+            } else {
+                badge(ui, theme, BadgeProps::new("Waiting for connection...").variant(BadgeVariant::Secondary));
+            }
+        });
 
         ui.add_space(16.0);
 
@@ -572,23 +581,54 @@ impl FreemouseApp {
 
         ui.add_space(16.0);
 
-        // Info card
-        card(ui, theme, CardProps::default(), |ui| {
-            ui.horizontal(|ui| {
-                let icon_rect = egui::Rect::from_min_size(
-                    ui.cursor().min,
-                    egui::vec2(36.0, 36.0),
-                );
-                let painter = ui.painter();
-                painter.rect_filled(icon_rect, 10.0, Color32::from_rgba_premultiplied(34, 26, 70, 255));
-                painter.text(icon_rect.center(), egui::Align2::CENTER_CENTER, "👥", egui::FontId::proportional(16.0), TEXT_PRIMARY);
-                ui.add_space(44.0);
-                ui.vertical(|ui| {
-                    heading(ui, theme, HeadingProps::new("Waiting for connection...").size(18.0));
-                    text(ui, theme, TextProps::new("Another computer can now connect using the details above.").size(14.0).color(TypographyColor::Muted));
+        if status.contains("Connected") {
+            // Remote toggle card
+            card(ui, theme, CardProps::default(), |ui| {
+                ui.horizontal(|ui| {
+                    let icon_rect = egui::Rect::from_min_size(
+                        ui.cursor().min,
+                        egui::vec2(36.0, 36.0),
+                    );
+                    let painter = ui.painter();
+                    painter.rect_filled(icon_rect, 10.0, Color32::from_rgba_premultiplied(34, 26, 70, 255));
+                    painter.text(icon_rect.center(), egui::Align2::CENTER_CENTER, "🔄", egui::FontId::proportional(16.0), TEXT_PRIMARY);
+                    ui.add_space(44.0);
+                    ui.vertical(|ui| {
+                        let remote = capture::os::is_remote();
+                        heading(ui, theme, HeadingProps::new(if remote { "Controlling remote computer" } else { "Controlling local computer" }).size(18.0));
+                        ui.add_space(4.0);
+                        text(ui, theme, TextProps::new("Mouse to right screen edge or tap toggle to switch").size(14.0).color(TypographyColor::Muted));
+                        ui.add_space(8.0);
+                        if Button::new(if remote { "⬅ Switch to Local" } else { "➡ Switch to Remote" })
+                            .variant(ButtonVariant::Secondary)
+                            .show(ui, theme)
+                            .clicked()
+                        {
+                            let new_remote = capture::os::toggle_remote();
+                            tracing::info!("Manual toggle remote: {}", if new_remote { "ON" } else { "OFF" });
+                        }
+                    });
                 });
             });
-        });
+        } else {
+            // Info card
+            card(ui, theme, CardProps::default(), |ui| {
+                ui.horizontal(|ui| {
+                    let icon_rect = egui::Rect::from_min_size(
+                        ui.cursor().min,
+                        egui::vec2(36.0, 36.0),
+                    );
+                    let painter = ui.painter();
+                    painter.rect_filled(icon_rect, 10.0, Color32::from_rgba_premultiplied(34, 26, 70, 255));
+                    painter.text(icon_rect.center(), egui::Align2::CENTER_CENTER, "👥", egui::FontId::proportional(16.0), TEXT_PRIMARY);
+                    ui.add_space(44.0);
+                    ui.vertical(|ui| {
+                        heading(ui, theme, HeadingProps::new("Waiting for connection...").size(18.0));
+                        text(ui, theme, TextProps::new("Another computer can now connect using the details above.").size(14.0).color(TypographyColor::Muted));
+                    });
+                });
+            });
+        }
 
         ui.add_space(24.0);
 
