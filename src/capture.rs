@@ -582,10 +582,12 @@ pub mod os {
         let mut devices = Vec::new();
         let input_dir = std::path::Path::new("/dev/input");
         if !input_dir.exists() {
+            tracing::warn!("/dev/input does not exist");
             return devices;
         }
 
         let Ok(entries) = std::fs::read_dir(input_dir) else {
+            tracing::warn!("Cannot read /dev/input (permission denied?)");
             return devices;
         };
 
@@ -599,35 +601,49 @@ pub mod os {
 
             // Look for event devices (keyboards, mice, touchpads)
             if name.starts_with("event") {
-                if let Ok(mut device) = Device::open(&path) {
-                    // Check if this is a keyboard, mouse, or composite device
-                    let has_keys = device
-                        .supported_keys()
-                        .is_some_and(|keys| keys.contains(evdev::Key::KEY_A));
-                    let has_mouse = device
-                        .supported_relative_axes()
-                        .is_some_and(|axes| axes.contains(evdev::RelativeAxisType::REL_X));
+                match Device::open(&path) {
+                    Ok(mut device) => {
+                        // Check if this is a keyboard, mouse, or composite device
+                        let has_keys = device
+                            .supported_keys()
+                            .is_some_and(|keys| keys.contains(evdev::Key::KEY_A));
+                        let has_mouse = device
+                            .supported_relative_axes()
+                            .is_some_and(|axes| axes.contains(evdev::RelativeAxisType::REL_X));
 
-                    let device_name = device.name().unwrap_or("unknown");
-                    let is_relevant = has_keys || has_mouse;
+                        let device_name = device.name().unwrap_or("unknown");
+                        let is_relevant = has_keys || has_mouse;
 
-                    tracing::debug!(
-                        "evdev device: {} (keys={}, mouse={}, relevant={})",
-                        device_name,
-                        has_keys,
-                        has_mouse,
-                        is_relevant
-                    );
+                        tracing::debug!(
+                            "evdev device: {} (keys={}, mouse={}, relevant={})",
+                            device_name,
+                            has_keys,
+                            has_mouse,
+                            is_relevant
+                        );
 
-                    if is_relevant {
-                        // Try to grab the device for exclusive access
-                        if device.grab().is_ok() || !has_keys {
-                            // Even if grab fails, still capture events (non-exclusive)
-                            devices.push(path);
+                        if is_relevant {
+                            // Try to grab the device for exclusive access
+                            if device.grab().is_ok() || !has_keys {
+                                // Even if grab fails, still capture events (non-exclusive)
+                                devices.push(path);
+                            }
                         }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Cannot open evdev device {:?}: {}", path, e);
                     }
                 }
             }
+        }
+
+        if devices.is_empty() {
+            tracing::warn!(
+                "No input devices found. Try:\n  \
+                 1. Add yourself to the 'input' group: sudo usermod -aG input $USER\n  \
+                 2. Log out and back in\n  \
+                 3. Or run freemouse with sudo"
+            );
         }
 
         devices
