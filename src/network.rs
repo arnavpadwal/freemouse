@@ -281,20 +281,46 @@ pub async fn start_client(
     port: u16,
     pin: &str,
 ) -> Result<Connection, Box<dyn std::error::Error + Send + Sync>> {
-    let mut stream = timeout(
-        Duration::from_secs(CONNECTION_TIMEOUT_SECS),
-        TcpStream::connect(format!("{}:{}", ip, port)),
-    )
-    .await
-    .map_err(|_| "Connection timeout: could not reach server")??;
-
-    let mut salt = [0u8; 16];
-    stream.read_exact(&mut salt).await?;
-
-    let key = derive_key(pin, &salt)?;
-    let cipher = ChaCha20Poly1305::new(&key);
-
-    Ok(Connection { stream, cipher })
+    let mut attempts = 0;
+    const MAX_ATTEMPTS: usize = 3;
+    
+    // Try IPv4 first, then IPv6
+    let addresses = [
+        format!("[{}]:{}", ip, port), // IPv6 format
+        format!("{}:{}", ip, port),   // IPv4 format
+    ];
+    
+    for address in addresses {
+        for retry in 1..=MAX_ATTEMPTS {
+            attempts += 1;
+            match timeout(
+                Duration::from_secs(CONNECTION_TIMEOUT_SECS),
+                TcpStream::connect(address.clone()),
+            )
+            .await {
+                Ok(Ok(mut stream)) => {
+                    let mut salt = [0u8; 16];
+                    stream.read_exact(&mut salt).await?;
+                    let key = derive_key(pin, &salt)?;
+                    return Ok(Connection { stream, cipher: ChaCha20Poly1305::new(&key) });
+                }
+                Ok(Err(e)) => {
+                    if retry < MAX_ATTEMPTS {
+                        tracing::warn!("Connection attempt {:}/{} failed: {}", attempts, MAX_ATTEMPTS, e);
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                }
+                Err(_) => {
+                    if retry < MAX_ATTEMPTS {
+                        tracing::warn!("Connection attempt {:}/{} timed out", attempts, MAX_ATTEMPTS);
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                }
+            }
+        }
+    }
+    
+    Err(format!("Failed to connect to {}:{} after {} attempts", ip, port, attempts).into())
 }
 
 /// Runs the share-side event loop: forwards captured events to the receiver
