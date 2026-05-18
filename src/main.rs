@@ -202,6 +202,7 @@ fn run_permission_checks() -> Vec<CheckResult> {
 
 struct FreemouseApp {
     mode: AppMode,
+    theme: Theme,
     logo_texture: Option<egui::TextureHandle>,
     ip_string: String,
     pin_string: String,
@@ -221,6 +222,7 @@ impl Default for FreemouseApp {
         let all_pass = checks.iter().all(|c| c.pass);
         Self {
             mode: if all_pass { AppMode::Home } else { AppMode::Onboarding },
+            theme: custom_theme(),
             logo_texture: None,
             ip_string: String::new(),
             pin_string: String::new(),
@@ -237,11 +239,10 @@ impl Default for FreemouseApp {
 
 impl eframe::App for FreemouseApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        let theme = custom_theme();
-
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(BG_PRIMARY))
             .show(ctx, |ui| {
+                let theme = self.theme.clone();
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     // ── header ────────────────────────────────────
                     ui.add_space(32.0);
