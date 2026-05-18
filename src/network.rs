@@ -258,10 +258,10 @@ pub async fn start_server(
     
     loop {
         attempts += 1;
+        eprintln!("[start_server] Attempt {}/{} to bind to port {}", attempts, MAX_ATTEMPTS, port);
         match tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await {
             Ok(listener) => {
-                // Server is now listening on port
-                tracing::info!("Server listening on 0.0.0.0:{}", port);
+                eprintln!("[start_server] SUCCESS: bound to port {}, waiting for connection...", port);
                 
                 // Accept with timeout
                 let (mut stream, _addr) = timeout(
