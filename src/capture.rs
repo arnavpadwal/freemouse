@@ -577,7 +577,7 @@ pub mod os {
     }
 
     /// Enumerate evdev input devices for keyboards and mice.
-    /// Opens and grabs them for exclusive input capture.
+    /// Opens them for passive input capture (no exclusive grab).
     fn find_input_devices() -> Vec<std::path::PathBuf> {
         let mut devices = Vec::new();
         let input_dir = std::path::Path::new("/dev/input");
@@ -602,7 +602,7 @@ pub mod os {
             // Look for event devices (keyboards, mice, touchpads)
             if name.starts_with("event") {
                 match Device::open(&path) {
-                    Ok(mut device) => {
+                    Ok(device) => {
                         // Check if this is a keyboard, mouse, or composite device
                         let has_keys = device
                             .supported_keys()
@@ -623,11 +623,7 @@ pub mod os {
                         );
 
                         if is_relevant {
-                            // Try to grab the device for exclusive access
-                            if device.grab().is_ok() || !has_keys {
-                                // Even if grab fails, still capture events (non-exclusive)
-                                devices.push(path);
-                            }
+                            devices.push(path);
                         }
                     }
                     Err(e) => {
@@ -1059,9 +1055,36 @@ pub mod os {
         })
     }
 
+    /// Query the actual cursor position from the display server (xdotool).
+    /// Returns `(x, y)` or `None` if unavailable.
+    fn query_cursor_pos() -> Option<(f64, f64)> {
+        let output = std::process::Command::new("xdotool")
+            .args(["getmouselocation", "--shell"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut x = None;
+        let mut y = None;
+        for line in stdout.lines() {
+            if let Some(val) = line.strip_prefix("X=") {
+                x = val.trim().parse::<f64>().ok();
+            } else if let Some(val) = line.strip_prefix("Y=") {
+                y = val.trim().parse::<f64>().ok();
+            }
+        }
+        Some((x?, y?))
+    }
+
     /// Start evdev-based input capture on Linux.
+    /// No exclusive grab — the local cursor always works.
+    /// Mouse Without Borders style: move mouse to right edge to transition
+    /// to the remote machine; move to left edge to come back.
+    /// Cursor position is periodically resynced from the display server so
+    /// edge detection matches the actual on-screen cursor.
     pub fn start_capture(tx: mpsc::Sender<NetworkEvent>, screen_width: f64) {
-        // Reset state for a fresh capture session
         IS_REMOTE.store(false, Ordering::SeqCst);
         STOP_FLAG.store(false, Ordering::SeqCst);
 
@@ -1078,12 +1101,10 @@ pub mod os {
             let mut opened_devices: Vec<Device> = Vec::new();
             for path in &devices {
                 match Device::open(path) {
-                    Ok(mut device) => {
-                        let name = device.name().unwrap_or("unknown").to_string();
+                    Ok(device) => {
                         tracing::info!(
-                            "Opened evdev device: {} (grab={})",
-                            name,
-                            device.grab().is_ok()
+                            "Opened evdev device: {} (passive, no grab)",
+                            device.name().unwrap_or("unknown")
                         );
                         opened_devices.push(device);
                     }
@@ -1097,19 +1118,27 @@ pub mod os {
                 return;
             }
 
-            // Mouse position tracking for edge detection
             let mut mouse_x: f64 = screen_width / 2.0;
             let mut mouse_y: f64 = 540.0;
+            let mut resync_counter: u32 = 0;
+            let edge_threshold = 5.0;
 
             loop {
                 if stop_flag.load(Ordering::SeqCst) {
                     break;
                 }
 
-                // Poll each device with a short timeout
+                // Periodically resync cursor position from the display server
+                resync_counter += 1;
+                if resync_counter >= 50 {
+                    resync_counter = 0;
+                    if let Some((rx, ry)) = query_cursor_pos() {
+                        mouse_x = rx;
+                        mouse_y = ry;
+                    }
+                }
+
                 for device in &mut opened_devices {
-                    // Non-blocking fetch
-                    // Use select! with timeout or handle events one at a time
                     match device.fetch_events() {
                         Ok(events) => {
                             for event in events {
@@ -1120,20 +1149,19 @@ pub mod os {
                                     screen_width,
                                     &mut mouse_x,
                                     &mut mouse_y,
+                                    edge_threshold,
                                 );
                             }
                         }
                         Err(e) => {
-                            // Would block is expected; other errors log
                             if e.kind() != std::io::ErrorKind::WouldBlock {
                                 tracing::debug!("evdev fetch error: {}", e);
                             }
-                            break; // Move to next device
+                            break;
                         }
                     }
                 }
 
-                // Small sleep to avoid busy-waiting
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
         });
@@ -1146,44 +1174,38 @@ pub mod os {
         screen_width: f64,
         mouse_x: &mut f64,
         mouse_y: &mut f64,
+        edge_threshold: f64,
     ) {
         let currently_remote = is_remote.load(Ordering::SeqCst);
 
         match event.event_type() {
             EventType::RELATIVE => {
-                // Mouse movement
                 let value = event.value();
                 match event.code() {
                     0 => {
-                        // REL_X
                         *mouse_x = (*mouse_x + value as f64).clamp(0.0, 10000.0);
-                        handle_mouse_move(*mouse_x, *mouse_y, tx, is_remote, screen_width);
+                        handle_mouse_move(*mouse_x, *mouse_y, tx, is_remote, screen_width, edge_threshold);
                     }
                     1 => {
-                        // REL_Y
                         *mouse_y = (*mouse_y + value as f64).clamp(0.0, 10000.0);
-                        handle_mouse_move(*mouse_x, *mouse_y, tx, is_remote, screen_width);
+                        handle_mouse_move(*mouse_x, *mouse_y, tx, is_remote, screen_width, edge_threshold);
                     }
                     8 if currently_remote => {
-                        // REL_WHEEL
                         let _ = tx.blocking_send(NetworkEvent::MouseScroll(0, value));
                     }
                     _ => {}
                 }
             }
             EventType::ABSOLUTE => {
-                // Absolute mouse position (touchpads, etc.)
                 let value = event.value() as f64;
                 match event.code() {
                     0 => {
-                        // ABS_X
                         *mouse_x = value;
-                        handle_mouse_move(*mouse_x, *mouse_y, tx, is_remote, screen_width);
+                        handle_mouse_move(*mouse_x, *mouse_y, tx, is_remote, screen_width, edge_threshold);
                     }
                     1 => {
-                        // ABS_Y
                         *mouse_y = value;
-                        handle_mouse_move(*mouse_x, *mouse_y, tx, is_remote, screen_width);
+                        handle_mouse_move(*mouse_x, *mouse_y, tx, is_remote, screen_width, edge_threshold);
                     }
                     _ => {}
                 }
@@ -1213,13 +1235,16 @@ pub mod os {
         tx: &mpsc::Sender<NetworkEvent>,
         is_remote: &AtomicBool,
         screen_width: f64,
+        edge_threshold: f64,
     ) {
         let currently_remote = is_remote.load(Ordering::SeqCst);
 
-        if !currently_remote && x >= screen_width - 2.0 {
+        if !currently_remote && x >= screen_width - edge_threshold {
             is_remote.store(true, Ordering::SeqCst);
-        } else if currently_remote && x <= 2.0 {
+            tracing::info!("Remote mode ON (mouse crossed right edge at x={:.0})", x);
+        } else if currently_remote && x <= edge_threshold {
             is_remote.store(false, Ordering::SeqCst);
+            tracing::info!("Remote mode OFF (mouse crossed left edge at x={:.0})", x);
         } else if currently_remote {
             let _ = tx.blocking_send(NetworkEvent::MouseMoved(x, y));
         }

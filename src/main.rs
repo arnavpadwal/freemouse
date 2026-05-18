@@ -219,126 +219,229 @@ impl eframe::App for FreemouseApp {
                 match self.mode.clone() {
                     AppMode::Onboarding => { self.render_onboarding(ctx, ui); }
                     AppMode::Home => {
-                        let btn_size = egui::vec2(220.0, 50.0);
-                        if ui
-                            .add_sized(
-                                btn_size,
-                                egui::Button::new(egui::RichText::new("📤 Share").size(20.0)),
-                            )
-                            .clicked()
-                        {
-                            capture::os::stop_capture();
+                        let card_frame = egui::Frame {
+                            fill: ctx.style().visuals.window_fill(),
+                            rounding: egui::Rounding::same(12.0),
+                            shadow: egui::epaint::Shadow {
+                offset: [0.0, 2.0].into(),
+                blur: 8.0,
+                spread: 0.0,
+                                color: egui::Color32::from_black_alpha(80),
+                            },
+                            ..Default::default()
+                        };
 
-                            let pin = format!("{:06}", rand::thread_rng().gen_range(0..999999));
-                            self.mode = AppMode::Share(pin.clone());
-                            *self.connection_status.lock().unwrap() =
-                                "Waiting for connection...".to_string();
+                        ui.add_space(15.0);
+                        card_frame.show(ui, |ui| {
+                            ui.set_min_width(280.0);
+                            ui.set_max_width(320.0);
+                            ui.add_space(16.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(egui::RichText::new("📤").size(28.0));
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new("Share").size(18.0).strong());
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new("Share your mouse & keyboard\nwith another computer")
+                                        .size(12.0)
+                                        .color(egui::Color32::GRAY),
+                                );
+                                ui.add_space(12.0);
+                                if ui
+                                    .add_sized(
+                                        egui::vec2(200.0, 44.0),
+                                        egui::Button::new(
+                                            egui::RichText::new("Start Sharing").size(16.0),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    capture::os::stop_capture();
+                                    let pin = format!("{:06}", rand::thread_rng().gen_range(0..999999));
+                                    self.mode = AppMode::Share(pin.clone());
+                                    *self.connection_status.lock().unwrap() =
+                                        "Waiting for connection...".to_string();
 
-                            let status_clone = self.connection_status.clone();
-                            let ctx_clone = ctx.clone();
-                            let pin_clone = pin.clone();
-                            let sw = self.screen_width;
+                                    let status_clone = self.connection_status.clone();
+                                    let ctx_clone = ctx.clone();
+                                    let pin_clone = pin.clone();
+                                    let sw = self.screen_width;
 
-                            std::thread::spawn(move || {
-                                let rt = tokio::runtime::Runtime::new().unwrap();
-                                rt.block_on(network::start_discovery_broadcast(4444));
+                                    std::thread::spawn(move || {
+                                        let rt = tokio::runtime::Runtime::new().unwrap();
+                                        rt.block_on(network::start_discovery_broadcast(4444));
+                                    });
+
+                                    self.server_task = Some(std::thread::spawn(move || {
+                                        let rt = match tokio::runtime::Runtime::new() {
+                                            Ok(rt) => rt,
+                                            Err(e) => {
+                                                *status_clone.lock().unwrap() =
+                                                    format!("Runtime Error: {}", e);
+                                                ctx_clone.request_repaint();
+                                                return;
+                                            }
+                                        };
+                                        rt.block_on(async {
+                                            match network::start_server(4444, &pin_clone).await {
+                                                Ok(conn) => {
+                                                    *status_clone.lock().unwrap() =
+                                                        "Connected!".to_string();
+                                                    ctx_clone.request_repaint();
+
+                                                    let (tx, rx) =
+                                                        mpsc::channel::<network::NetworkEvent>(100);
+
+                                                    capture::os::start_capture(tx.clone(), sw);
+                                                    clipboard::start_clipboard_monitor(tx);
+
+                                                    network::run_share_loop(conn, rx).await;
+
+                                                    *status_clone.lock().unwrap() =
+                                                        "Disconnected".to_string();
+                                                    ctx_clone.request_repaint();
+                                                }
+                                                Err(e) => {
+                                                    *status_clone.lock().unwrap() =
+                                                        format!("Error: {}", e);
+                                                    ctx_clone.request_repaint();
+                                                }
+                                            }
+                                        });
+                                    }));
+                                }
                             });
+                            ui.add_space(16.0);
+                        });
 
-                            self.server_task = Some(std::thread::spawn(move || {
-                                let rt = match tokio::runtime::Runtime::new() {
-                                    Ok(rt) => rt,
-                                    Err(e) => {
-                                        *status_clone.lock().unwrap() =
-                                            format!("Runtime Error: {}", e);
-                                        ctx_clone.request_repaint();
-                                        return;
-                                    }
-                                };
-                                rt.block_on(async {
-                                    match network::start_server(4444, &pin_clone).await {
-                                        Ok(conn) => {
-                                            *status_clone.lock().unwrap() = "Connected!".to_string();
-                                            ctx_clone.request_repaint();
+                        ui.add_space(16.0);
 
-                                            let (tx, rx) =
-                                                mpsc::channel::<network::NetworkEvent>(100);
-
-                                            capture::os::start_capture(tx.clone(), sw);
-                                            clipboard::start_clipboard_monitor(tx);
-
-                                            network::run_share_loop(conn, rx).await;
-
-                                            *status_clone.lock().unwrap() =
-                                                "Disconnected".to_string();
-                                            ctx_clone.request_repaint();
-                                        }
-                                        Err(e) => {
-                                            *status_clone.lock().unwrap() =
-                                                format!("Error: {}", e);
-                                            ctx_clone.request_repaint();
-                                        }
-                                    }
-                                });
-                            }));
-                        }
-                        ui.add_space(10.0);
-                        if ui
-                            .add_sized(
-                                btn_size,
-                                egui::Button::new(egui::RichText::new("📥 Receive").size(20.0)),
-                            )
-                            .clicked()
-                        {
-                            self.client_task = None;
-                            capture::os::stop_capture();
-
-                            self.mode = AppMode::Receive;
-                            *self.connection_status.lock().unwrap() =
-                                "Scanning network...".to_string();
-
-                            let rx = network::start_discovery_listener();
-                            self._discovery_rx = Some(rx);
-
-                            *self.connection_status.lock().unwrap() =
-                                "Enter details or pick a discovered server.".to_string();
-                        }
+                        card_frame.show(ui, |ui| {
+                            ui.set_min_width(280.0);
+                            ui.set_max_width(320.0);
+                            ui.add_space(16.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(egui::RichText::new("📥").size(28.0));
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new("Receive").size(18.0).strong());
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new("Take control of another\ncomputer's mouse & keyboard")
+                                        .size(12.0)
+                                        .color(egui::Color32::GRAY),
+                                );
+                                ui.add_space(12.0);
+                                if ui
+                                    .add_sized(
+                                        egui::vec2(200.0, 44.0),
+                                        egui::Button::new(
+                                            egui::RichText::new("Start Receiving").size(16.0),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    self.client_task = None;
+                                    capture::os::stop_capture();
+                                    self.mode = AppMode::Receive;
+                                    *self.connection_status.lock().unwrap() =
+                                        "Scanning network...".to_string();
+                                    let rx = network::start_discovery_listener();
+                                    self._discovery_rx = Some(rx);
+                                    *self.connection_status.lock().unwrap() =
+                                        "Enter details or pick a discovered server.".to_string();
+                                }
+                            });
+                            ui.add_space(16.0);
+                        });
                     }
                     AppMode::Share(pin) => {
                         let local_ip = local_ip_address::local_ip()
                             .map(|ip| ip.to_string())
                             .unwrap_or_else(|_| "Unknown IP".to_string());
 
-                        ui.label(egui::RichText::new("📤 Share Mode Active").size(24.0));
                         ui.add_space(10.0);
-                        ui.label("Tell the Receiver to enter these details:");
+                        ui.label(egui::RichText::new("📤 Share Mode").size(24.0).strong());
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("Share your mouse & keyboard with a remote computer")
+                                .size(12.0)
+                                .color(egui::Color32::GRAY),
+                        );
+                        ui.add_space(20.0);
 
-                        ui.add_space(15.0);
-                        ui.group(|ui| {
-                            ui.set_width(260.0);
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("IP Address:").strong());
-                                ui.label(
-                                    egui::RichText::new(&local_ip)
-                                        .color(egui::Color32::from_rgb(100, 200, 255))
-                                        .size(18.0),
-                                );
+                        let info_frame = egui::Frame {
+                            fill: ctx.style().visuals.window_fill(),
+                            rounding: egui::Rounding::same(12.0),
+                            ..Default::default()
+                        };
+
+                        info_frame.show(ui, |ui| {
+                            ui.add_space(16.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(egui::RichText::new("Connection Details").size(16.0).strong());
+                                ui.add_space(12.0);
+
+                                ui.horizontal(|ui| {
+                                    ui.add_space(20.0);
+                                    ui.label(egui::RichText::new("IP Address").size(12.0).color(egui::Color32::GRAY));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.add_space(20.0);
+                                        ui.label(
+                                            egui::RichText::new(&local_ip)
+                                                .color(egui::Color32::from_rgb(100, 200, 255))
+                                                .size(18.0)
+                                                .monospace(),
+                                        );
+                                    });
+                                });
+                                ui.add_space(8.0);
+                                ui.separator();
+                                ui.add_space(8.0);
+
+                                ui.horizontal(|ui| {
+                                    ui.add_space(20.0);
+                                    ui.label(egui::RichText::new("PIN Code").size(12.0).color(egui::Color32::GRAY));
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.add_space(20.0);
+                                        ui.label(
+                                            egui::RichText::new(&pin)
+                                                .color(egui::Color32::from_rgb(100, 220, 100))
+                                                .size(24.0)
+                                                .strong()
+                                                .monospace(),
+                                        );
+                                    });
+                                });
                             });
-                            ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("PIN Code:  ").strong());
-                                ui.label(
-                                    egui::RichText::new(&pin)
-                                        .color(egui::Color32::from_rgb(100, 255, 150))
-                                        .size(18.0)
-                                        .strong(),
-                                );
-                            });
+                            ui.add_space(16.0);
+                        });
+
+                        ui.add_space(16.0);
+
+                        let status_color = if status.contains("Connected") {
+                            egui::Color32::from_rgb(100, 220, 100)
+                        } else if status.contains("Error") {
+                            egui::Color32::from_rgb(240, 100, 100)
+                        } else {
+                            egui::Color32::GRAY
+                        };
+
+                        ui.horizontal(|ui| {
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("●").size(10.0).color(status_color));
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(&status).size(13.0).color(status_color));
                         });
 
                         ui.add_space(20.0);
-                        ui.label(status);
 
-                        ui.add_space(10.0);
-                        if ui.button("<< Back").clicked() {
+                        if ui
+                            .add_sized(
+                                egui::vec2(120.0, 36.0),
+                                egui::Button::new("← Back"),
+                            )
+                            .clicked()
+                        {
                             self.server_task = None;
                             capture::os::stop_capture();
                             self.mode = AppMode::Home;
@@ -346,9 +449,23 @@ impl eframe::App for FreemouseApp {
                         }
                     }
                     AppMode::Receive => {
-                        ui.label(egui::RichText::new("📥 Receive Mode").size(24.0));
-                        ui.add_space(10.0);
+                        let info_frame = egui::Frame {
+                            fill: ctx.style().visuals.window_fill(),
+                            rounding: egui::Rounding::same(12.0),
+                            ..Default::default()
+                        };
 
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("📥 Receive Mode").size(24.0).strong());
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("Connect to a remote computer to control it")
+                                .size(12.0)
+                                .color(egui::Color32::GRAY),
+                        );
+                        ui.add_space(20.0);
+
+                        // Poll for discovered servers
                         if let Some(rx) = &mut self._discovery_rx {
                             while let Ok(server) = rx.try_recv() {
                                 let display = format!("{} ({})", server.hostname, server.ip);
@@ -360,40 +477,109 @@ impl eframe::App for FreemouseApp {
                         }
 
                         if !self.discovered_servers.is_empty() {
-                            ui.label("Discovered servers:");
-                            ui.add_space(5.0);
-                            for (i, server_str) in self.discovered_servers.iter().enumerate() {
-                                if ui
-                                    .selectable_label(
-                                        self.ip_string == self.discovered_raw[i].ip,
-                                        server_str,
-                                    )
-                                    .clicked()
-                                {
-                                    self.ip_string = self.discovered_raw[i].ip.clone();
+                            info_frame.show(ui, |ui| {
+                                ui.add_space(12.0);
+                                ui.vertical_centered(|ui| {
+                                    ui.label(egui::RichText::new("Discovered Servers").size(14.0).strong());
+                                });
+                                ui.add_space(8.0);
+                                for (i, _server_str) in self.discovered_servers.iter().enumerate() {
+                                    let selected = self.ip_string == self.discovered_raw[i].ip;
+                                    let bg = if selected {
+                                        egui::Color32::from_rgba_premultiplied(60, 120, 200, 40)
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    };
+                                    let response = egui::Frame::none()
+                                        .fill(bg)
+                                        .rounding(egui::Rounding::same(6.0))
+                                        .show(ui, |ui| {
+                                            ui.set_min_width(280.0);
+                                            ui.add_space(8.0);
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(12.0);
+                                                ui.label(
+                                                    egui::RichText::new("💻").size(18.0),
+                                                );
+                                                ui.add_space(8.0);
+                                                ui.vertical(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(&self.discovered_raw[i].hostname)
+                                                            .size(14.0)
+                                                            .strong(),
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new(&self.discovered_raw[i].ip)
+                                                            .size(11.0)
+                                                            .color(egui::Color32::GRAY)
+                                                            .monospace(),
+                                                    );
+                                                });
+                                            });
+                                            ui.add_space(8.0);
+                                        });
+                                    if response.response.clicked() {
+                                        self.ip_string = self.discovered_raw[i].ip.clone();
+                                    }
                                 }
-                            }
-                            ui.add_space(10.0);
+                                ui.add_space(12.0);
+                            });
+                            ui.add_space(16.0);
                         }
 
-                        ui.horizontal(|ui| {
-                            ui.label("IP Address:");
-                            ui.text_edit_singleline(&mut self.ip_string);
-                        });
-                        ui.add_space(5.0);
-                        ui.horizontal(|ui| {
-                            ui.label("PIN Code:  ");
-                            ui.text_edit_singleline(&mut self.pin_string);
+                        info_frame.show(ui, |ui| {
+                            ui.add_space(16.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(egui::RichText::new("Manual Connection").size(14.0).strong());
+                            });
+                            ui.add_space(12.0);
+
+                            ui.horizontal(|ui| {
+                                ui.add_space(16.0);
+                                ui.label(egui::RichText::new("IP Address").size(12.0).color(egui::Color32::GRAY));
+                                ui.add_space(8.0);
+                            });
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(16.0);
+                                ui.add_sized(
+                                    egui::vec2(ui.available_width() - 32.0, 28.0),
+                                    egui::TextEdit::singleline(&mut self.ip_string)
+                                        .hint_text("192.168.1.100"),
+                                );
+                            });
+                            ui.add_space(12.0);
+
+                            ui.horizontal(|ui| {
+                                ui.add_space(16.0);
+                                ui.label(egui::RichText::new("PIN Code").size(12.0).color(egui::Color32::GRAY));
+                                ui.add_space(8.0);
+                            });
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(16.0);
+                                ui.add_sized(
+                                    egui::vec2(ui.available_width() - 32.0, 28.0),
+                                    egui::TextEdit::singleline(&mut self.pin_string)
+                                        .hint_text("000000")
+                                        .password(true),
+                                );
+                            });
+                            ui.add_space(16.0);
                         });
 
-                        ui.add_space(15.0);
+                        ui.add_space(16.0);
+
                         if ui
                             .add_enabled(
                                 !self.ip_string.is_empty() && !self.pin_string.is_empty(),
-                                egui::Button::new(egui::RichText::new("🔗 Connect").size(18.0)),
+                                egui::Button::new(
+                                    egui::RichText::new("🔗 Connect").size(16.0),
+                                ),
                             )
                             .clicked()
                         {
+                            self.client_task = None;
                             *self.connection_status.lock().unwrap() = "Connecting...".to_string();
                             let ip = self.ip_string.clone();
                             let pin = self.pin_string.clone();
@@ -433,10 +619,31 @@ impl eframe::App for FreemouseApp {
                         }
 
                         ui.add_space(10.0);
-                        ui.label(status);
 
-                        ui.add_space(10.0);
-                        if ui.button("<< Back").clicked() {
+                        let status_color = if status.contains("Success") {
+                            egui::Color32::from_rgb(100, 220, 100)
+                        } else if status.contains("Error") {
+                            egui::Color32::from_rgb(240, 100, 100)
+                        } else {
+                            egui::Color32::GRAY
+                        };
+
+                        ui.horizontal(|ui| {
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("●").size(10.0).color(status_color));
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(&status).size(13.0).color(status_color));
+                        });
+
+                        ui.add_space(20.0);
+
+                        if ui
+                            .add_sized(
+                                egui::vec2(120.0, 36.0),
+                                egui::Button::new("← Back"),
+                            )
+                            .clicked()
+                        {
                             self.client_task = None;
                             capture::os::stop_capture();
                             self.mode = AppMode::Home;
@@ -535,8 +742,8 @@ fn main() -> Result<(), eframe::Error> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([450.0, 400.0])
-            .with_min_inner_size([350.0, 300.0]),
+            .with_inner_size([520.0, 600.0])
+            .with_min_inner_size([400.0, 400.0]),
         ..Default::default()
     };
 
