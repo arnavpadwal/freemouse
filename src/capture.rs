@@ -105,6 +105,20 @@ pub mod os {
         STOP_FLAG.store(true, Ordering::SeqCst);
     }
 
+    /// Manual toggle remote mode on/off.
+    /// Returns the new state.
+    pub fn toggle_remote() -> bool {
+        let new = !IS_REMOTE.load(Ordering::SeqCst);
+        IS_REMOTE.store(new, Ordering::SeqCst);
+        tracing::info!("Remote mode manually toggled to {}", if new { "ON" } else { "OFF" });
+        new
+    }
+
+    /// Returns current remote mode state.
+    pub fn is_remote() -> bool {
+        IS_REMOTE.load(Ordering::SeqCst)
+    }
+
     /// Start global input capture. Spawns a thread that uses rdev::grab
     /// to intercept input events when in "remote" mode.
     pub fn start_capture(tx: mpsc::Sender<NetworkEvent>, screen_width: f64) {
