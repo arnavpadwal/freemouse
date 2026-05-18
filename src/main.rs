@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 #[derive(PartialEq, Clone)]
 enum AppMode {
     Home,
-    Share(String), // The PIN
+    Share(String),
     Receive,
 }
 
@@ -23,16 +23,12 @@ struct FreemouseApp {
     ip_string: String,
     pin_string: String,
     connection_status: Arc<Mutex<String>>,
-    server_task: Option<tokio::task::JoinHandle<()>>,
-    client_task: Option<tokio::task::JoinHandle<()>>,
-    /// Discovered servers, formatted as display strings
+    server_task: Option<std::thread::JoinHandle<()>>,
+    client_task: Option<std::thread::JoinHandle<()>>,
     discovered_servers: Vec<String>,
-    /// Raw discovered server list (resolved IPs)
     discovered_raw: Vec<network::DiscoveredServer>,
-    /// The screen width for edge detection
     screen_width: f64,
     screen_height: f64,
-    /// Discovery RX handle stored to keep the task alive
     _discovery_rx: Option<mpsc::Receiver<network::DiscoveredServer>>,
 }
 
@@ -74,7 +70,6 @@ impl eframe::App for FreemouseApp {
                 );
                 ui.add_space(20.0);
 
-                // Show screen resolution info
                 ui.label(
                     egui::RichText::new(format!(
                         "Display: {:.0}x{:.0}",
@@ -95,10 +90,7 @@ impl eframe::App for FreemouseApp {
                             )
                             .clicked()
                         {
-                            // Clean up any previous session
-                            if let Some(task) = self.server_task.take() {
-                                task.abort();
-                            }
+                            self.server_task = None;
                             capture::os::stop_capture();
 
                             let pin = format!("{:06}", rand::thread_rng().gen_range(0..999999));
@@ -111,32 +103,38 @@ impl eframe::App for FreemouseApp {
                             let pin_clone = pin.clone();
                             let sw = self.screen_width;
 
-                            // Start discovery broadcast in the background
-                            tokio::spawn(network::start_discovery_broadcast(4444));
+                            std::thread::spawn(move || {
+                                let rt = tokio::runtime::Runtime::new().unwrap();
+                                rt.block_on(network::start_discovery_broadcast(4444));
+                            });
 
-                            self.server_task = Some(tokio::spawn(async move {
-                                match network::start_server(4444, &pin_clone).await {
-                                    Ok(conn) => {
-                                        *status_clone.lock().unwrap() = "Connected!".to_string();
-                                        ctx_clone.request_repaint();
+                            self.server_task = Some(std::thread::spawn(move || {
+                                let rt = tokio::runtime::Runtime::new().unwrap();
+                                rt.block_on(async {
+                                    match network::start_server(4444, &pin_clone).await {
+                                        Ok(conn) => {
+                                            *status_clone.lock().unwrap() = "Connected!".to_string();
+                                            ctx_clone.request_repaint();
 
-                                        let (tx, rx) = mpsc::channel::<network::NetworkEvent>(100);
+                                            let (tx, rx) =
+                                                mpsc::channel::<network::NetworkEvent>(100);
 
-                                        // Start input capture (share machine)
-                                        capture::os::start_capture(tx.clone(), sw);
-                                        // Start clipboard monitoring
-                                        clipboard::start_clipboard_monitor(tx);
+                                            capture::os::start_capture(tx.clone(), sw);
+                                            clipboard::start_clipboard_monitor(tx);
 
-                                        network::run_share_loop(conn, rx).await;
+                                            network::run_share_loop(conn, rx).await;
 
-                                        *status_clone.lock().unwrap() = "Disconnected".to_string();
-                                        ctx_clone.request_repaint();
+                                            *status_clone.lock().unwrap() =
+                                                "Disconnected".to_string();
+                                            ctx_clone.request_repaint();
+                                        }
+                                        Err(e) => {
+                                            *status_clone.lock().unwrap() =
+                                                format!("Error: {}", e);
+                                            ctx_clone.request_repaint();
+                                        }
                                     }
-                                    Err(e) => {
-                                        *status_clone.lock().unwrap() = format!("Error: {}", e);
-                                        ctx_clone.request_repaint();
-                                    }
-                                }
+                                });
                             }));
                         }
                         ui.add_space(10.0);
@@ -147,21 +145,16 @@ impl eframe::App for FreemouseApp {
                             )
                             .clicked()
                         {
-                            // Clean up any previous session
-                            if let Some(task) = self.client_task.take() {
-                                task.abort();
-                            }
+                            self.client_task = None;
                             capture::os::stop_capture();
 
                             self.mode = AppMode::Receive;
                             *self.connection_status.lock().unwrap() =
                                 "Scanning network...".to_string();
 
-                            // Start discovery listener
                             let rx = network::start_discovery_listener();
                             self._discovery_rx = Some(rx);
 
-                            // Poll discovery in the update loop below
                             *self.connection_status.lock().unwrap() =
                                 "Enter details or pick a discovered server.".to_string();
                         }
@@ -202,10 +195,7 @@ impl eframe::App for FreemouseApp {
 
                         ui.add_space(10.0);
                         if ui.button("<< Back").clicked() {
-                            if let Some(task) = self.server_task.take() {
-                                task.abort();
-                            }
-                            // Stop input capture
+                            self.server_task = None;
                             capture::os::stop_capture();
                             self.mode = AppMode::Home;
                             *self.connection_status.lock().unwrap() = "Ready".to_string();
@@ -215,7 +205,6 @@ impl eframe::App for FreemouseApp {
                         ui.label(egui::RichText::new("📥 Receive Mode").size(24.0));
                         ui.add_space(10.0);
 
-                        // Poll for discovered servers
                         if let Some(rx) = &mut self._discovery_rx {
                             while let Ok(server) = rx.try_recv() {
                                 let display = format!("{} ({})", server.hostname, server.ip);
@@ -226,7 +215,6 @@ impl eframe::App for FreemouseApp {
                             }
                         }
 
-                        // Show discovered servers
                         if !self.discovered_servers.is_empty() {
                             ui.label("Discovered servers:");
                             ui.add_space(5.0);
@@ -239,7 +227,6 @@ impl eframe::App for FreemouseApp {
                                     .clicked()
                                 {
                                     self.ip_string = self.discovered_raw[i].ip.clone();
-                                    // If the discovered server also gives us a hostname, set it
                                 }
                             }
                             ui.add_space(10.0);
@@ -263,41 +250,42 @@ impl eframe::App for FreemouseApp {
                             )
                             .clicked()
                         {
-                            // Abort any existing connection first
-                            if let Some(task) = self.client_task.take() {
-                                task.abort();
-                            }
+                            self.client_task = None;
                             *self.connection_status.lock().unwrap() = "Connecting...".to_string();
                             let ip = self.ip_string.clone();
                             let pin = self.pin_string.clone();
                             let status_clone = self.connection_status.clone();
                             let ctx_clone = ctx.clone();
-                            // Clear discovery since we're connecting
                             self._discovery_rx = None;
 
-                            self.client_task = Some(tokio::spawn(async move {
-                                match network::start_client(&ip, 4444, &pin).await {
-                                    Ok(conn) => {
-                                        *status_clone.lock().unwrap() =
-                                            "Connected Successfully!".to_string();
-                                        ctx_clone.request_repaint();
+                            self.client_task = Some(std::thread::spawn(move || {
+                                let rt = tokio::runtime::Runtime::new().unwrap();
+                                rt.block_on(async {
+                                    match network::start_client(&ip, 4444, &pin).await {
+                                        Ok(conn) => {
+                                            *status_clone.lock().unwrap() =
+                                                "Connected Successfully!".to_string();
+                                            ctx_clone.request_repaint();
 
-                                        let (tx, rx) = mpsc::channel::<network::NetworkEvent>(100);
+                                            let (tx, rx) =
+                                                mpsc::channel::<network::NetworkEvent>(100);
 
-                                        // Start input simulation (receive machine)
-                                        tokio::spawn(capture::os::start_simulation(rx));
+                                            let rt2 = tokio::runtime::Runtime::new().unwrap();
+                                            rt2.spawn(capture::os::start_simulation(rx));
 
-                                        network::run_receive_loop(conn, tx).await;
+                                            network::run_receive_loop(conn, tx).await;
 
-                                        *status_clone.lock().unwrap() = "Disconnected".to_string();
-                                        ctx_clone.request_repaint();
+                                            *status_clone.lock().unwrap() =
+                                                "Disconnected".to_string();
+                                            ctx_clone.request_repaint();
+                                        }
+                                        Err(e) => {
+                                            *status_clone.lock().unwrap() =
+                                                format!("Connection Error: {}", e);
+                                            ctx_clone.request_repaint();
+                                        }
                                     }
-                                    Err(e) => {
-                                        *status_clone.lock().unwrap() =
-                                            format!("Connection Error: {}", e);
-                                        ctx_clone.request_repaint();
-                                    }
-                                }
+                                });
                             }));
                         }
 
@@ -306,10 +294,7 @@ impl eframe::App for FreemouseApp {
 
                         ui.add_space(10.0);
                         if ui.button("<< Back").clicked() {
-                            if let Some(task) = self.client_task.take() {
-                                task.abort();
-                            }
-                            // Stop any input simulation
+                            self.client_task = None;
                             capture::os::stop_capture();
                             self.mode = AppMode::Home;
                             self._discovery_rx = None;
@@ -322,13 +307,11 @@ impl eframe::App for FreemouseApp {
             });
         });
 
-        // Ensure UI updates continuously for status changes
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), eframe::Error> {
+fn main() -> Result<(), eframe::Error> {
     tracing_subscriber::fmt::init();
 
     let options = eframe::NativeOptions {

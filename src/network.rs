@@ -534,37 +534,40 @@ pub async fn start_discovery_broadcast(port: u16) {
 pub fn start_discovery_listener() -> mpsc::Receiver<DiscoveredServer> {
     let (tx, rx) = mpsc::channel::<DiscoveredServer>(100);
 
-    tokio::spawn(async move {
-        let socket = match create_listen_socket().await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("Failed to create discovery listener socket: {}", e);
-                return;
-            }
-        };
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let socket = match create_listen_socket().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("Failed to create discovery listener socket: {}", e);
+                    return;
+                }
+            };
 
-        let mut buf = vec![0u8; 1024];
-        loop {
-            match socket.recv_from(&mut buf).await {
-                Ok((len, _addr)) => {
-                    let data = &buf[..len];
-                    if let Ok(packet) = bincode::deserialize::<DiscoveryPacket>(data) {
-                        if packet.magic == *DISCOVERY_MAGIC {
-                            let server = DiscoveredServer {
-                                ip: packet.ip,
-                                hostname: packet.hostname,
-                                port: packet.port,
-                            };
-                            let _ = tx.send(server).await;
+            let mut buf = vec![0u8; 1024];
+            loop {
+                match socket.recv_from(&mut buf).await {
+                    Ok((len, _addr)) => {
+                        let data = &buf[..len];
+                        if let Ok(packet) = bincode::deserialize::<DiscoveryPacket>(data) {
+                            if packet.magic == *DISCOVERY_MAGIC {
+                                let server = DiscoveredServer {
+                                    ip: packet.ip,
+                                    hostname: packet.hostname,
+                                    port: packet.port,
+                                };
+                                let _ = tx.send(server).await;
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!("Discovery recv error: {}", e);
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    Err(e) => {
+                        tracing::warn!("Discovery recv error: {}", e);
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
                 }
             }
-        }
+        });
     });
 
     rx
