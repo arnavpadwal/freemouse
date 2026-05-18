@@ -229,15 +229,18 @@ pub mod os {
 
     /// Start receiving and simulating input events on the receiver side.
     pub async fn start_simulation(mut rx: mpsc::Receiver<NetworkEvent>) {
+        eprintln!("[simulation] start_simulation called (enigo)");
         let mut enigo = match Enigo::new(&Settings::default()) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("Failed to create Enigo instance: {:?}", e);
+                eprintln!("[simulation] Failed to create Enigo instance: {:?}", e);
                 return;
             }
         };
+        eprintln!("[simulation] enigo initialized, waiting for events...");
 
         while let Some(event) = rx.recv().await {
+            eprintln!("[simulation] received: {:?}", event);
             match event {
                 NetworkEvent::MouseMoved(x, y) => {
                     let _ = enigo.move_mouse(x as i32, y as i32, Coordinate::Abs);
@@ -1155,6 +1158,7 @@ pub mod os {
     /// Edge detection uses velocity-pattern analysis on REL events
     /// (works on X11 and Wayland alike).
     pub fn start_capture(tx: mpsc::Sender<NetworkEvent>, screen_width: f64) {
+        eprintln!("[capture] start_capture called, screen_width={}", screen_width);
         IS_REMOTE.store(false, Ordering::SeqCst);
         STOP_FLAG.store(false, Ordering::SeqCst);
 
@@ -1163,8 +1167,9 @@ pub mod os {
 
         std::thread::spawn(move || {
             let devices = find_input_devices();
+            eprintln!("[capture] find_input_devices returned {} device(s)", devices.len());
             if devices.is_empty() {
-                tracing::warn!("No evdev input devices found for capture");
+                eprintln!("[capture] NO devices found — capture thread exiting!");
                 return;
             }
 
@@ -1172,19 +1177,17 @@ pub mod os {
             for path in &devices {
                 match Device::open(path) {
                     Ok(device) => {
-                        tracing::info!(
-                            "Opened evdev device: {} (passive, no grab)",
-                            device.name().unwrap_or("unknown")
-                        );
+                        eprintln!("[capture] opened: {}", device.name().unwrap_or("unknown"));
                         opened_devices.push(device);
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to open evdev device {:?}: {}", path, e);
+                        eprintln!("[capture] failed to open {:?}: {}", path, e);
                     }
                 }
             }
 
             if opened_devices.is_empty() {
+                eprintln!("[capture] could not open any device — exiting");
                 return;
             }
 
@@ -1192,16 +1195,11 @@ pub mod os {
             let edge_threshold = 5.0;
             let mut last_abs_x = 0.0_f64;
 
-            tracing::info!(
-                "Capture started: {} device(s), threshold={}, edge_px={}",
-                opened_devices.len(),
-                3,
-                edge_threshold,
-            );
+            eprintln!("[capture] entering event loop, {} devices, remote={}", opened_devices.len(), is_remote.load(Ordering::SeqCst));
 
             loop {
                 if stop_flag.load(Ordering::SeqCst) {
-                    tracing::info!("Capture stopped");
+                    eprintln!("[capture] stop flag set, exiting");
                     break;
                 }
 
@@ -1222,9 +1220,9 @@ pub mod os {
                         }
                         Err(e) => {
                             if e.kind() != std::io::ErrorKind::WouldBlock {
-                                tracing::warn!("evdev fetch error: {}", e);
+                                eprintln!("[capture] evdev fetch error: {}", e);
                             }
-                            break;
+                            // WouldBlock = no events pending, continue to next device
                         }
                     }
                 }
@@ -1250,30 +1248,24 @@ pub mod os {
                 let value = event.value();
                 match event.code() {
                     0 => {
-                        // REL_X — feed into velocity-based edge detector
                         if let Some(is_right) = edge.feed_rel_x(value) {
                             if is_right && !currently_remote {
                                 is_remote.store(true, Ordering::SeqCst);
-                                tracing::info!("Remote ON (REL right edge)");
+                                eprintln!("[capture] REMOTE ON (REL right edge)");
                             } else if !is_right && currently_remote {
                                 is_remote.store(false, Ordering::SeqCst);
-                                tracing::info!("Remote OFF (REL left edge)");
+                                eprintln!("[capture] REMOTE OFF (REL left edge)");
                             }
                         }
                         let remote_now = is_remote.load(Ordering::SeqCst);
                         if remote_now {
-                            let _ = tx.blocking_send(NetworkEvent::MouseMoveRelative(
-                                value as f64, 0.0,
-                            ));
+                            let _ = tx.blocking_send(NetworkEvent::MouseMoveRelative(value as f64, 0.0));
                         }
                     }
                     1 => {
-                        // REL_Y
                         let remote_now = is_remote.load(Ordering::SeqCst);
                         if remote_now {
-                            let _ = tx.blocking_send(NetworkEvent::MouseMoveRelative(
-                                0.0, value as f64,
-                            ));
+                            let _ = tx.blocking_send(NetworkEvent::MouseMoveRelative(0.0, value as f64));
                         }
                     }
                     8 => {
@@ -1289,16 +1281,15 @@ pub mod os {
                 let val = event.value() as f64;
                 match event.code() {
                     0 => {
-                        // ABS_X
                         *last_abs_x = val;
                         if !currently_remote && val >= screen_width - edge_threshold {
                             is_remote.store(true, Ordering::SeqCst);
                             edge.reset();
-                            tracing::info!("Remote ON (ABS X {:.0})", val);
+                            eprintln!("[capture] REMOTE ON (ABS X {:.0})", val);
                         } else if currently_remote && val <= edge_threshold {
                             is_remote.store(false, Ordering::SeqCst);
                             edge.reset();
-                            tracing::info!("Remote OFF (ABS X {:.0})", val);
+                            eprintln!("[capture] REMOTE OFF (ABS X {:.0})", val);
                         }
                         let remote_now = is_remote.load(Ordering::SeqCst);
                         if remote_now {
@@ -1306,7 +1297,6 @@ pub mod os {
                         }
                     }
                     1 => {
-                        // ABS_Y
                         let remote_now = is_remote.load(Ordering::SeqCst);
                         if remote_now {
                             let _ = tx.blocking_send(NetworkEvent::MouseMoved(*last_abs_x, val));
@@ -1322,6 +1312,7 @@ pub mod os {
 
                 if remote_now {
                     if let Some(kc) = evdev_key_to_keycode(key) {
+                        eprintln!("[capture] key {:?} pressed={}", kc, pressed);
                         if pressed {
                             let _ = tx.blocking_send(NetworkEvent::KeyDown(kc));
                         } else {
@@ -1337,15 +1328,18 @@ pub mod os {
 
     /// Start input simulation on Linux using uinput virtual devices.
     pub async fn start_simulation(mut rx: mpsc::Receiver<NetworkEvent>) {
+        eprintln!("[simulation] start_simulation called");
         let mut uinput_dev = match create_uinput_device() {
             Some(d) => d,
             None => {
-                tracing::error!("Failed to create uinput virtual device");
+                eprintln!("[simulation] FAILED to create uinput device — check /dev/uinput permissions!");
                 return;
             }
         };
+        eprintln!("[simulation] uinput device created, waiting for events...");
 
         while let Some(event) = rx.recv().await {
+            eprintln!("[simulation] received: {:?}", event);
             match event {
                 NetworkEvent::MouseMoved(x, y) => {
                     let _ = uinput_dev.emit(&[

@@ -395,12 +395,15 @@ pub async fn run_share_loop(conn: Connection, mut rx: mpsc::Receiver<NetworkEven
         loop {
             tokio::select! {
                 Some(event) = rx.recv() => {
+                    eprintln!("[network] share sending: {:?}", event);
                     if send_encrypted(&mut write_half, &cipher2, &event).await.is_err() {
+                        eprintln!("[network] share send error, breaking");
                         break;
                     }
                 }
                 _ = keepalive_interval.tick() => {
                     if send_encrypted(&mut write_half, &cipher2, &NetworkEvent::KeepAlive).await.is_err() {
+                        eprintln!("[network] share keepalive send error, breaking");
                         break;
                     }
                 }
@@ -463,12 +466,15 @@ pub async fn run_receive_loop(conn: Connection, tx: mpsc::Sender<NetworkEvent>) 
                                     // No action needed.
                                 }
                                 _ => {
-                                    // Forward mouse/keyboard events to simulation
+                                    eprintln!("[network] receive forwarding: {:?}", event);
                                     let _ = tx.send(event).await;
                                 }
                             }
                         }
-                        Err(_) => break,
+                        Err(e) => {
+                            eprintln!("[network] receive error: {:?}", e);
+                            break;
+                        }
                     }
                 }
                 _ = shutdown_rx.recv() => break,

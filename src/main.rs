@@ -416,6 +416,7 @@ impl FreemouseApp {
                                     rt.block_on(async {
                                         match network::start_server(4444, &pin_clone).await {
                                             Ok(conn) => {
+                                                eprintln!("[share] server accepted connection, starting capture");
                                                 *status_clone.lock().unwrap() =
                                                     "Connected!".to_string();
                                                 ctx_clone.request_repaint();
@@ -426,7 +427,9 @@ impl FreemouseApp {
                                                 capture::os::start_capture(tx.clone(), sw);
                                                 clipboard::start_clipboard_monitor(tx);
 
+                                                eprintln!("[share] entering run_share_loop");
                                                 network::run_share_loop(conn, rx).await;
+                                                eprintln!("[share] run_share_loop exited");
 
                                                 *status_clone.lock().unwrap() =
                                                     "Disconnected".to_string();
@@ -822,6 +825,7 @@ impl FreemouseApp {
                     rt.block_on(async {
                         match network::start_client(&ip, 4444, &pin).await {
                             Ok(conn) => {
+                                eprintln!("[receive] connected to share server");
                                 *status_clone.lock().unwrap() =
                                     "Connected Successfully!".to_string();
                                 ctx_clone.request_repaint();
@@ -831,8 +835,10 @@ impl FreemouseApp {
 
                                 let rt2 = tokio::runtime::Runtime::new().unwrap();
                                 rt2.spawn(capture::os::start_simulation(rx));
+                                eprintln!("[receive] simulation task spawned");
 
                                 network::run_receive_loop(conn, tx).await;
+                                eprintln!("[receive] run_receive_loop exited");
 
                                 *status_clone.lock().unwrap() =
                                     "Disconnected".to_string();
@@ -865,7 +871,6 @@ impl FreemouseApp {
 }
 
 fn main() -> eframe::Result {
-    // Prefer Wayland on Linux when available
     #[cfg(target_os = "linux")]
     {
         if std::env::var("WAYLAND_DISPLAY").is_ok() {
@@ -873,7 +878,10 @@ fn main() -> eframe::Result {
         }
     }
 
-    tracing_subscriber::fmt::init();
+    // Suppress egui-shadcn theme init spam
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,egui_shadcn::theme=off".into());
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     // Load icon from PNG
     let icon_bytes = include_bytes!("../FreeMouse.png");
