@@ -582,7 +582,8 @@ pub mod os {
 #[cfg(target_os = "linux")]
 pub mod os {
     use super::*;
-    use evdev::{Device, EventType, InputEvent, Key as EvdevKey};
+    use evdev::{Device, EventType, InputEvent, Key as EvdevKey, RelativeAxisType};
+    use evdev::uinput::VirtualDeviceBuilder;
 
     lazy_static::lazy_static! {
         static ref IS_REMOTE: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
@@ -593,212 +594,461 @@ pub mod os {
         STOP_FLAG.store(true, Ordering::SeqCst);
     }
 
-    /// Manual toggle remote mode on/off.
-    /// Returns the new state.
     pub fn toggle_remote() -> bool {
         let new = !IS_REMOTE.load(Ordering::SeqCst);
         IS_REMOTE.store(new, Ordering::SeqCst);
-        tracing::info!("Remote mode manually toggled to {}", if new { "ON" } else { "OFF" });
+        eprintln!("[capture] Remote toggled to {}", if new { "ON" } else { "OFF" });
         new
     }
 
-    /// Returns current remote mode state.
     pub fn is_remote() -> bool {
         IS_REMOTE.load(Ordering::SeqCst)
     }
 
-    /// Enumerate evdev input devices for keyboards and mice.
-    /// Opens them for passive input capture (no exclusive grab).
-    fn find_input_devices() -> Vec<std::path::PathBuf> {
+    /// Create a uinput virtual device that supports BOTH keyboard and mouse.
+    /// This is used for replaying grabbed events (so local system gets input)
+    /// AND for receiving remote input events.
+    fn create_uinput_device() -> Option<evdev::uinput::VirtualDevice> {
+        let mut keys = evdev::AttributeSet::<evdev::Key>::new();
+        for k in [
+            EvdevKey::BTN_LEFT,
+            EvdevKey::BTN_RIGHT,
+            EvdevKey::BTN_MIDDLE,
+            EvdevKey::BTN_SIDE,
+            EvdevKey::BTN_EXTRA,
+            EvdevKey::KEY_A, EvdevKey::KEY_B, EvdevKey::KEY_C, EvdevKey::KEY_D,
+            EvdevKey::KEY_E, EvdevKey::KEY_F, EvdevKey::KEY_G, EvdevKey::KEY_H,
+            EvdevKey::KEY_I, EvdevKey::KEY_J, EvdevKey::KEY_K, EvdevKey::KEY_L,
+            EvdevKey::KEY_M, EvdevKey::KEY_N, EvdevKey::KEY_O, EvdevKey::KEY_P,
+            EvdevKey::KEY_Q, EvdevKey::KEY_R, EvdevKey::KEY_S, EvdevKey::KEY_T,
+            EvdevKey::KEY_U, EvdevKey::KEY_V, EvdevKey::KEY_W, EvdevKey::KEY_X,
+            EvdevKey::KEY_Y, EvdevKey::KEY_Z,
+            EvdevKey::KEY_0, EvdevKey::KEY_1, EvdevKey::KEY_2, EvdevKey::KEY_3,
+            EvdevKey::KEY_4, EvdevKey::KEY_5, EvdevKey::KEY_6, EvdevKey::KEY_7,
+            EvdevKey::KEY_8, EvdevKey::KEY_9,
+            EvdevKey::KEY_LEFTALT, EvdevKey::KEY_RIGHTALT,
+            EvdevKey::KEY_LEFTCTRL, EvdevKey::KEY_RIGHTCTRL,
+            EvdevKey::KEY_LEFTSHIFT, EvdevKey::KEY_RIGHTSHIFT,
+            EvdevKey::KEY_LEFTMETA, EvdevKey::KEY_RIGHTMETA,
+            EvdevKey::KEY_UP, EvdevKey::KEY_DOWN, EvdevKey::KEY_LEFT, EvdevKey::KEY_RIGHT,
+            EvdevKey::KEY_PAGEUP, EvdevKey::KEY_PAGEDOWN,
+            EvdevKey::KEY_HOME, EvdevKey::KEY_END,
+            EvdevKey::KEY_INSERT, EvdevKey::KEY_DELETE,
+            EvdevKey::KEY_BACKSPACE, EvdevKey::KEY_SPACE, EvdevKey::KEY_TAB,
+            EvdevKey::KEY_ENTER, EvdevKey::KEY_ESC, EvdevKey::KEY_CAPSLOCK,
+            EvdevKey::KEY_F1, EvdevKey::KEY_F2, EvdevKey::KEY_F3, EvdevKey::KEY_F4,
+            EvdevKey::KEY_F5, EvdevKey::KEY_F6, EvdevKey::KEY_F7, EvdevKey::KEY_F8,
+            EvdevKey::KEY_F9, EvdevKey::KEY_F10, EvdevKey::KEY_F11, EvdevKey::KEY_F12,
+            EvdevKey::KEY_MINUS, EvdevKey::KEY_EQUAL,
+            EvdevKey::KEY_LEFTBRACE, EvdevKey::KEY_RIGHTBRACE,
+            EvdevKey::KEY_BACKSLASH, EvdevKey::KEY_SEMICOLON,
+            EvdevKey::KEY_APOSTROPHE, EvdevKey::KEY_COMMA,
+            EvdevKey::KEY_DOT, EvdevKey::KEY_SLASH, EvdevKey::KEY_GRAVE,
+            EvdevKey::KEY_KP0, EvdevKey::KEY_KP1, EvdevKey::KEY_KP2, EvdevKey::KEY_KP3,
+            EvdevKey::KEY_KP4, EvdevKey::KEY_KP5, EvdevKey::KEY_KP6, EvdevKey::KEY_KP7,
+            EvdevKey::KEY_KP8, EvdevKey::KEY_KP9,
+            EvdevKey::KEY_KPPLUS, EvdevKey::KEY_KPMINUS,
+            EvdevKey::KEY_KPASTERISK, EvdevKey::KEY_KPSLASH,
+            EvdevKey::KEY_KPENTER, EvdevKey::KEY_KPDOT,
+            EvdevKey::KEY_SYSRQ, EvdevKey::KEY_SCROLLLOCK,
+            EvdevKey::KEY_PAUSE, EvdevKey::KEY_COMPOSE,
+        ] {
+            keys.insert(k);
+        }
+
+        let mut rel = evdev::AttributeSet::<evdev::RelativeAxisType>::new();
+        rel.insert(RelativeAxisType::REL_X);
+        rel.insert(RelativeAxisType::REL_Y);
+        rel.insert(RelativeAxisType::REL_WHEEL);
+        rel.insert(RelativeAxisType::REL_HWHEEL);
+
+        VirtualDeviceBuilder::new()
+            .ok()
+            .map(|b| b.name("Freemouse Virtual Input"))
+            .and_then(|b| b.with_keys(&keys).ok())
+            .and_then(|b| b.with_relative_axes(&rel).ok())
+            .and_then(|b| b.build().ok())
+    }
+
+    /// Find and open evdev keyboard/mouse devices.
+    /// Returns (Device, is_keyboard) pairs.
+    fn find_input_devices() -> Vec<(Device, bool)> {
         let mut devices = Vec::new();
         let input_dir = std::path::Path::new("/dev/input");
         if !input_dir.exists() {
-            tracing::warn!("/dev/input does not exist");
+            eprintln!("[capture] /dev/input does not exist");
             return devices;
         }
 
         let Ok(entries) = std::fs::read_dir(input_dir) else {
-            tracing::warn!("Cannot read /dev/input (permission denied?)");
+            eprintln!("[capture] Cannot read /dev/input");
             return devices;
         };
 
         for entry in entries.flatten() {
             let path = entry.path();
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.starts_with("event") {
+                continue;
+            }
 
-            // Look for event devices (keyboards, mice, touchpads)
-            if name.starts_with("event") {
-                match Device::open(&path) {
-                    Ok(device) => {
-                        // Check if this is a keyboard, mouse, or composite device
-                        let has_keys = device
-                            .supported_keys()
-                            .is_some_and(|keys| keys.contains(evdev::Key::KEY_A));
-                        let has_mouse = device
-                            .supported_relative_axes()
-                            .is_some_and(|axes| axes.contains(evdev::RelativeAxisType::REL_X));
+            match Device::open(&path) {
+                Ok(device) => {
+                    let has_keys = device.supported_keys()
+                        .is_some_and(|k| k.contains(EvdevKey::KEY_A));
+                    let has_mouse = device.supported_relative_axes()
+                        .is_some_and(|a| a.contains(RelativeAxisType::REL_X));
+                    let has_buttons = device.supported_keys()
+                        .is_some_and(|k| k.contains(EvdevKey::BTN_LEFT));
 
-                        let device_name = device.name().unwrap_or("unknown");
-                        let is_relevant = has_keys || has_mouse;
-
-                        tracing::debug!(
-                            "evdev device: {} (keys={}, mouse={}, relevant={})",
-                            device_name,
-                            has_keys,
-                            has_mouse,
-                            is_relevant
-                        );
-
-                        if is_relevant {
-                            devices.push(path);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Cannot open evdev device {:?}: {}", path, e);
+                    if has_keys || has_mouse || has_buttons {
+                        let dev_name = device.name().unwrap_or("unknown");
+                        eprintln!("[capture] found: {} (keys={} mouse={} buttons={})",
+                            dev_name, has_keys, has_mouse, has_buttons);
+                        devices.push((device, has_keys));
                     }
                 }
+                Err(e) => {
+                    eprintln!("[capture] cannot open {:?}: {}", path, e);
+                }
             }
-        }
-
-        if devices.is_empty() {
-            tracing::warn!(
-                "No input devices found. Try:\n  \
-                 1. Add yourself to the 'input' group: sudo usermod -aG input $USER\n  \
-                 2. Log out and back in\n  \
-                 3. Or run freemouse with sudo"
-            );
         }
 
         devices
     }
 
-    /// Creates a virtual uinput device for simulating input on Linux.
-    fn create_uinput_device() -> Option<evdev::uinput::VirtualDevice> {
-        use evdev::uinput::VirtualDeviceBuilder;
-
-        let mut keys = evdev::AttributeSet::<evdev::Key>::new();
-        for k in [
-            evdev::Key::KEY_A,
-            evdev::Key::KEY_B,
-            evdev::Key::KEY_C,
-            evdev::Key::KEY_D,
-            evdev::Key::KEY_E,
-            evdev::Key::KEY_F,
-            evdev::Key::KEY_G,
-            evdev::Key::KEY_H,
-            evdev::Key::KEY_I,
-            evdev::Key::KEY_J,
-            evdev::Key::KEY_K,
-            evdev::Key::KEY_L,
-            evdev::Key::KEY_M,
-            evdev::Key::KEY_N,
-            evdev::Key::KEY_O,
-            evdev::Key::KEY_P,
-            evdev::Key::KEY_Q,
-            evdev::Key::KEY_R,
-            evdev::Key::KEY_S,
-            evdev::Key::KEY_T,
-            evdev::Key::KEY_U,
-            evdev::Key::KEY_V,
-            evdev::Key::KEY_W,
-            evdev::Key::KEY_X,
-            evdev::Key::KEY_Y,
-            evdev::Key::KEY_Z,
-            evdev::Key::KEY_1,
-            evdev::Key::KEY_2,
-            evdev::Key::KEY_3,
-            evdev::Key::KEY_4,
-            evdev::Key::KEY_5,
-            evdev::Key::KEY_6,
-            evdev::Key::KEY_7,
-            evdev::Key::KEY_8,
-            evdev::Key::KEY_9,
-            evdev::Key::KEY_0,
-            evdev::Key::KEY_LEFTALT,
-            evdev::Key::KEY_RIGHTALT,
-            evdev::Key::KEY_LEFTCTRL,
-            evdev::Key::KEY_RIGHTCTRL,
-            evdev::Key::KEY_LEFTSHIFT,
-            evdev::Key::KEY_RIGHTSHIFT,
-            evdev::Key::KEY_LEFTMETA,
-            evdev::Key::KEY_RIGHTMETA,
-            evdev::Key::KEY_UP,
-            evdev::Key::KEY_DOWN,
-            evdev::Key::KEY_LEFT,
-            evdev::Key::KEY_RIGHT,
-            evdev::Key::KEY_PAGEUP,
-            evdev::Key::KEY_PAGEDOWN,
-            evdev::Key::KEY_HOME,
-            evdev::Key::KEY_END,
-            evdev::Key::KEY_INSERT,
-            evdev::Key::KEY_DELETE,
-            evdev::Key::KEY_BACKSPACE,
-            evdev::Key::KEY_SPACE,
-            evdev::Key::KEY_TAB,
-            evdev::Key::KEY_ENTER,
-            evdev::Key::KEY_ESC,
-            evdev::Key::KEY_CAPSLOCK,
-            evdev::Key::KEY_F1,
-            evdev::Key::KEY_F2,
-            evdev::Key::KEY_F3,
-            evdev::Key::KEY_F4,
-            evdev::Key::KEY_F5,
-            evdev::Key::KEY_F6,
-            evdev::Key::KEY_F7,
-            evdev::Key::KEY_F8,
-            evdev::Key::KEY_F9,
-            evdev::Key::KEY_F10,
-            evdev::Key::KEY_F11,
-            evdev::Key::KEY_F12,
-            evdev::Key::KEY_MINUS,
-            evdev::Key::KEY_EQUAL,
-            evdev::Key::KEY_LEFTBRACE,
-            evdev::Key::KEY_RIGHTBRACE,
-            evdev::Key::KEY_BACKSLASH,
-            evdev::Key::KEY_SEMICOLON,
-            evdev::Key::KEY_APOSTROPHE,
-            evdev::Key::KEY_COMMA,
-            evdev::Key::KEY_DOT,
-            evdev::Key::KEY_SLASH,
-            evdev::Key::KEY_GRAVE,
-            evdev::Key::KEY_KP0,
-            evdev::Key::KEY_KP1,
-            evdev::Key::KEY_KP2,
-            evdev::Key::KEY_KP3,
-            evdev::Key::KEY_KP4,
-            evdev::Key::KEY_KP5,
-            evdev::Key::KEY_KP6,
-            evdev::Key::KEY_KP7,
-            evdev::Key::KEY_KP8,
-            evdev::Key::KEY_KP9,
-            evdev::Key::KEY_KPPLUS,
-            evdev::Key::KEY_KPMINUS,
-            evdev::Key::KEY_KPASTERISK,
-            evdev::Key::KEY_KPSLASH,
-            evdev::Key::KEY_KPENTER,
-            evdev::Key::KEY_KPDOT,
-        ] {
-            keys.insert(k);
-        }
-
-        let device = VirtualDeviceBuilder::new()
-            .ok()?
-            .name("Freemouse Virtual Input")
-            .with_keys(&keys)
-            .ok()?
-            .build()
-            .ok()?;
-
-        Some(device)
+    struct EdgeDetector {
+        right_streak: u32,
+        left_streak: u32,
+        threshold: u32,
+        was_right_edge: bool,
+        was_left_edge: bool,
     }
 
-    /// Convert a Linux evdev key code to our cross-platform KeyCode
-    fn evdev_key_to_keycode(ev: EvdevKey) -> Option<KeyCode> {
-        Some(match ev {
+    impl EdgeDetector {
+        fn new(threshold: u32) -> Self {
+            Self {
+                right_streak: 0,
+                left_streak: 0,
+                threshold,
+                was_right_edge: false,
+                was_left_edge: false,
+            }
+        }
+
+        fn feed_rel_x(&mut self, value: i32) -> Option<bool> {
+            if value > 0 {
+                self.right_streak += 1;
+                self.left_streak = 0;
+                if self.right_streak >= self.threshold && !self.was_right_edge {
+                    self.was_right_edge = true;
+                    self.was_left_edge = false;
+                    return Some(true);
+                }
+            } else if value < 0 {
+                self.left_streak += 1;
+                self.right_streak = 0;
+                if self.left_streak >= self.threshold && !self.was_left_edge {
+                    self.was_left_edge = true;
+                    self.was_right_edge = false;
+                    return Some(false);
+                }
+            }
+            None
+        }
+
+        fn reset(&mut self) {
+            self.right_streak = 0;
+            self.left_streak = 0;
+            self.was_right_edge = false;
+            self.was_left_edge = false;
+        }
+    }
+
+    /// Start evdev-based input capture on Linux.
+    /// Uses exclusive grab + uinput replay (like Barrier/Synergy).
+    pub fn start_capture(tx: mpsc::Sender<NetworkEvent>, screen_width: f64) {
+        eprintln!("[capture] start_capture called, screen_width={}", screen_width);
+        IS_REMOTE.store(false, Ordering::SeqCst);
+        STOP_FLAG.store(false, Ordering::SeqCst);
+
+        let is_remote = IS_REMOTE.clone();
+        let stop_flag = STOP_FLAG.clone();
+
+        std::thread::spawn(move || {
+            // Create uinput device for replaying events
+            let mut uinput = match create_uinput_device() {
+                Some(d) => d,
+                None => {
+                    eprintln!("[capture] FAILED to create uinput device — check /dev/uinput permissions!");
+                    return;
+                }
+            };
+            eprintln!("[capture] uinput device created");
+
+            // Find and grab input devices
+            let raw_devices = find_input_devices();
+            if raw_devices.is_empty() {
+                eprintln!("[capture] NO input devices found");
+                return;
+            }
+
+            let mut grabbed: Vec<(Device, bool)> = Vec::new();
+            for (mut dev, is_kbd) in raw_devices {
+                match dev.grab() {
+                    Ok(()) => {
+                        eprintln!("[capture] grabbed: {} (keyboard={})",
+                            dev.name().unwrap_or("unknown"), is_kbd);
+                        grabbed.push((dev, is_kbd));
+                    }
+                    Err(e) => {
+                        eprintln!("[capture] grab failed for {}: {} (try sudo or add to input group)",
+                            dev.name().unwrap_or("unknown"), e);
+                    }
+                }
+            }
+
+            if grabbed.is_empty() {
+                eprintln!("[capture] could not grab any devices — exiting");
+                return;
+            }
+
+            let mut edge_detector = EdgeDetector::new(3);
+            let edge_threshold = 5.0;
+            let mut last_abs_x = 0.0_f64;
+
+            eprintln!("[capture] entering event loop, {} grabbed devices", grabbed.len());
+
+            loop {
+                if stop_flag.load(Ordering::SeqCst) {
+                    // Ungrab all devices before exiting
+                    for (dev, _) in &mut grabbed {
+                        let _ = dev.ungrab();
+                    }
+                    eprintln!("[capture] stopped, devices ungrabbed");
+                    break;
+                }
+
+                for (device, _is_kbd) in &mut grabbed {
+                    match device.fetch_events() {
+                        Ok(events) => {
+                            for event in events {
+                                // ALWAYS replay via uinput so local system gets input
+                                let _ = uinput.emit(&[event]);
+
+                                // Also process for remote forwarding
+                                let currently_remote = is_remote.load(Ordering::SeqCst);
+                                handle_evdev_event(
+                                    &event,
+                                    &tx,
+                                    &is_remote,
+                                    screen_width,
+                                    &mut edge_detector,
+                                    edge_threshold,
+                                    &mut last_abs_x,
+                                    currently_remote,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if e.kind() != std::io::ErrorKind::WouldBlock {
+                                eprintln!("[capture] evdev fetch error: {}", e);
+                            }
+                        }
+                    }
+                }
+
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+    }
+
+    fn handle_evdev_event(
+        event: &InputEvent,
+        tx: &mpsc::Sender<NetworkEvent>,
+        is_remote: &AtomicBool,
+        screen_width: f64,
+        edge: &mut EdgeDetector,
+        edge_threshold: f64,
+        last_abs_x: &mut f64,
+        currently_remote: bool,
+    ) {
+        match event.event_type() {
+            EventType::RELATIVE => {
+                let value = event.value();
+                match event.code() {
+                    0 => {
+                        if let Some(is_right) = edge.feed_rel_x(value) {
+                            if is_right && !currently_remote {
+                                is_remote.store(true, Ordering::SeqCst);
+                                eprintln!("[capture] REMOTE ON (REL right edge)");
+                            } else if !is_right && currently_remote {
+                                is_remote.store(false, Ordering::SeqCst);
+                                eprintln!("[capture] REMOTE OFF (REL left edge)");
+                            }
+                        }
+                        let remote_now = is_remote.load(Ordering::SeqCst);
+                        if remote_now {
+                            match tx.blocking_send(NetworkEvent::MouseMoveRelative(value as f64, 0.0)) {
+                                Ok(()) => eprintln!("[capture] sent REL_X={}", value),
+                                Err(e) => eprintln!("[capture] REL_X send FAILED: {:?}", e),
+                            }
+                        }
+                    }
+                    1 => {
+                        let remote_now = is_remote.load(Ordering::SeqCst);
+                        if remote_now {
+                            match tx.blocking_send(NetworkEvent::MouseMoveRelative(0.0, value as f64)) {
+                                Ok(()) => eprintln!("[capture] sent REL_Y={}", value),
+                                Err(e) => eprintln!("[capture] REL_Y send FAILED: {:?}", e),
+                            }
+                        }
+                    }
+                    8 => {
+                        let remote_now = is_remote.load(Ordering::SeqCst);
+                        if remote_now {
+                            match tx.blocking_send(NetworkEvent::MouseScroll(0, value)) {
+                                Ok(()) => eprintln!("[capture] sent WHEEL={}", value),
+                                Err(e) => eprintln!("[capture] WHEEL send FAILED: {:?}", e),
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            EventType::ABSOLUTE => {
+                let val = event.value() as f64;
+                match event.code() {
+                    0 => {
+                        *last_abs_x = val;
+                        if !currently_remote && val >= screen_width - edge_threshold {
+                            is_remote.store(true, Ordering::SeqCst);
+                            edge.reset();
+                            eprintln!("[capture] REMOTE ON (ABS X {:.0})", val);
+                        } else if currently_remote && val <= edge_threshold {
+                            is_remote.store(false, Ordering::SeqCst);
+                            edge.reset();
+                            eprintln!("[capture] REMOTE OFF (ABS X {:.0})", val);
+                        }
+                        let remote_now = is_remote.load(Ordering::SeqCst);
+                        if remote_now {
+                            match tx.blocking_send(NetworkEvent::MouseMoved(val, *last_abs_x)) {
+                                Ok(()) => eprintln!("[capture] sent ABS_X={:.0}", val),
+                                Err(e) => eprintln!("[capture] ABS_X send FAILED: {:?}", e),
+                            }
+                        }
+                    }
+                    1 => {
+                        let remote_now = is_remote.load(Ordering::SeqCst);
+                        if remote_now {
+                            match tx.blocking_send(NetworkEvent::MouseMoved(*last_abs_x, val)) {
+                                Ok(()) => eprintln!("[capture] sent ABS_Y={:.0}", val),
+                                Err(e) => eprintln!("[capture] ABS_Y send FAILED: {:?}", e),
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            EventType::KEY => {
+                let key = EvdevKey::new(event.code());
+                let pressed = event.value() != 0;
+                let remote_now = is_remote.load(Ordering::SeqCst);
+
+                if remote_now {
+                    if let Some(kc) = evdev_key_to_keycode(key) {
+                        eprintln!("[capture] key {:?} pressed={}", kc, pressed);
+                        if pressed {
+                            match tx.blocking_send(NetworkEvent::KeyDown(kc)) {
+                                Ok(()) => eprintln!("[capture] sent KeyDown"),
+                                Err(e) => eprintln!("[capture] KeyDown send FAILED: {:?}", e),
+                            }
+                        } else {
+                            match tx.blocking_send(NetworkEvent::KeyUp(kc)) {
+                                Ok(()) => eprintln!("[capture] sent KeyUp"),
+                                Err(e) => eprintln!("[capture] KeyUp send FAILED: {:?}", e),
+                            }
+                        }
+                    }
+                }
+            }
+            EventType::SYNCHRONIZATION => {}
+            _ => {}
+        }
+    }
+
+    /// Start input simulation on Linux using uinput virtual devices.
+    pub async fn start_simulation(mut rx: mpsc::Receiver<NetworkEvent>) {
+        eprintln!("[simulation] start_simulation called");
+        let mut uinput_dev = match create_uinput_device() {
+            Some(d) => d,
+            None => {
+                eprintln!("[simulation] FAILED to create uinput device — check /dev/uinput permissions!");
+                return;
+            }
+        };
+        eprintln!("[simulation] uinput device created, waiting for events...");
+
+        while let Some(event) = rx.recv().await {
+            eprintln!("[simulation] received: {:?}", event);
+            match event {
+                NetworkEvent::MouseMoved(x, y) => {
+                    let _ = uinput_dev.emit(&[
+                        InputEvent::new(EventType::ABSOLUTE, 0, x as i32),
+                        InputEvent::new(EventType::ABSOLUTE, 1, y as i32),
+                        InputEvent::new(EventType::SYNCHRONIZATION, 0, 0),
+                    ]);
+                }
+                NetworkEvent::MouseMoveRelative(dx, dy) => {
+                    let _ = uinput_dev.emit(&[
+                        InputEvent::new(EventType::RELATIVE, 0, dx as i32),
+                        InputEvent::new(EventType::RELATIVE, 1, dy as i32),
+                        InputEvent::new(EventType::SYNCHRONIZATION, 0, 0),
+                    ]);
+                }
+                NetworkEvent::MouseButtonDown(btn) => {
+                    let code = mousebutton_to_evdev_code(&btn);
+                    let _ = uinput_dev.emit(&[
+                        InputEvent::new(EventType::KEY, code, 1),
+                        InputEvent::new(EventType::SYNCHRONIZATION, 0, 0),
+                    ]);
+                }
+                NetworkEvent::MouseButtonUp(btn) => {
+                    let code = mousebutton_to_evdev_code(&btn);
+                    let _ = uinput_dev.emit(&[
+                        InputEvent::new(EventType::KEY, code, 0),
+                        InputEvent::new(EventType::SYNCHRONIZATION, 0, 0),
+                    ]);
+                }
+                NetworkEvent::MouseScroll(_dx, dy) => {
+                    let _ = uinput_dev.emit(&[
+                        InputEvent::new(EventType::RELATIVE, 8, dy),
+                        InputEvent::new(EventType::SYNCHRONIZATION, 0, 0),
+                    ]);
+                }
+                NetworkEvent::KeyDown(kc) => {
+                    if let Some(ev) = keycode_to_evdev_key(&kc) {
+                        let _ = uinput_dev.emit(&[
+                            InputEvent::new(EventType::KEY, ev.code(), 1),
+                            InputEvent::new(EventType::SYNCHRONIZATION, 0, 0),
+                        ]);
+                    }
+                }
+                NetworkEvent::KeyUp(kc) => {
+                    if let Some(ev) = keycode_to_evdev_key(&kc) {
+                        let _ = uinput_dev.emit(&[
+                            InputEvent::new(EventType::KEY, ev.code(), 0),
+                            InputEvent::new(EventType::SYNCHRONIZATION, 0, 0),
+                        ]);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn evdev_key_to_keycode(key: EvdevKey) -> Option<KeyCode> {
+        Some(match key {
             EvdevKey::KEY_A => KeyCode::A,
             EvdevKey::KEY_B => KeyCode::B,
             EvdevKey::KEY_C => KeyCode::C,
@@ -906,7 +1156,6 @@ pub mod os {
         })
     }
 
-    /// Convert our cross-platform KeyCode to evdev key code for simulation
     fn keycode_to_evdev_key(kc: &KeyCode) -> Option<EvdevKey> {
         Some(match kc {
             KeyCode::A => EvdevKey::KEY_A,
@@ -1011,421 +1260,51 @@ pub mod os {
             KeyCode::ScrollLock => EvdevKey::KEY_SCROLLLOCK,
             KeyCode::Pause => EvdevKey::KEY_PAUSE,
             KeyCode::Menu => EvdevKey::KEY_COMPOSE,
-            // For Unicode and Other, try to find a best match or return None
             KeyCode::Unicode(c) => match c {
                 'a'..='z' | 'A'..='Z' => {
                     let idx = c.to_ascii_lowercase() as u8 - b'a';
                     return Some(match idx {
-                        0 => EvdevKey::KEY_A,
-                        1 => EvdevKey::KEY_B,
-                        2 => EvdevKey::KEY_C,
-                        3 => EvdevKey::KEY_D,
-                        4 => EvdevKey::KEY_E,
-                        5 => EvdevKey::KEY_F,
-                        6 => EvdevKey::KEY_G,
-                        7 => EvdevKey::KEY_H,
-                        8 => EvdevKey::KEY_I,
-                        9 => EvdevKey::KEY_J,
-                        10 => EvdevKey::KEY_K,
-                        11 => EvdevKey::KEY_L,
-                        12 => EvdevKey::KEY_M,
-                        13 => EvdevKey::KEY_N,
-                        14 => EvdevKey::KEY_O,
-                        15 => EvdevKey::KEY_P,
-                        16 => EvdevKey::KEY_Q,
-                        17 => EvdevKey::KEY_R,
-                        18 => EvdevKey::KEY_S,
-                        19 => EvdevKey::KEY_T,
-                        20 => EvdevKey::KEY_U,
-                        21 => EvdevKey::KEY_V,
-                        22 => EvdevKey::KEY_W,
-                        23 => EvdevKey::KEY_X,
-                        24 => EvdevKey::KEY_Y,
-                        25 => EvdevKey::KEY_Z,
+                        0 => EvdevKey::KEY_A, 1 => EvdevKey::KEY_B, 2 => EvdevKey::KEY_C,
+                        3 => EvdevKey::KEY_D, 4 => EvdevKey::KEY_E, 5 => EvdevKey::KEY_F,
+                        6 => EvdevKey::KEY_G, 7 => EvdevKey::KEY_H, 8 => EvdevKey::KEY_I,
+                        9 => EvdevKey::KEY_J, 10 => EvdevKey::KEY_K, 11 => EvdevKey::KEY_L,
+                        12 => EvdevKey::KEY_M, 13 => EvdevKey::KEY_N, 14 => EvdevKey::KEY_O,
+                        15 => EvdevKey::KEY_P, 16 => EvdevKey::KEY_Q, 17 => EvdevKey::KEY_R,
+                        18 => EvdevKey::KEY_S, 19 => EvdevKey::KEY_T, 20 => EvdevKey::KEY_U,
+                        21 => EvdevKey::KEY_V, 22 => EvdevKey::KEY_W, 23 => EvdevKey::KEY_X,
+                        24 => EvdevKey::KEY_Y, 25 => EvdevKey::KEY_Z,
                         _ => return None,
                     });
                 }
                 '0'..='9' => {
                     return Some(match c {
-                        '0' => EvdevKey::KEY_0,
-                        '1' => EvdevKey::KEY_1,
-                        '2' => EvdevKey::KEY_2,
-                        '3' => EvdevKey::KEY_3,
-                        '4' => EvdevKey::KEY_4,
-                        '5' => EvdevKey::KEY_5,
-                        '6' => EvdevKey::KEY_6,
-                        '7' => EvdevKey::KEY_7,
-                        '8' => EvdevKey::KEY_8,
-                        '9' => EvdevKey::KEY_9,
+                        '0' => EvdevKey::KEY_0, '1' => EvdevKey::KEY_1,
+                        '2' => EvdevKey::KEY_2, '3' => EvdevKey::KEY_3,
+                        '4' => EvdevKey::KEY_4, '5' => EvdevKey::KEY_5,
+                        '6' => EvdevKey::KEY_6, '7' => EvdevKey::KEY_7,
+                        '8' => EvdevKey::KEY_8, '9' => EvdevKey::KEY_9,
                         _ => return None,
                     });
                 }
                 _ => return None,
             },
             KeyCode::Option => EvdevKey::KEY_LEFTALT,
-            KeyCode::F13
-            | KeyCode::F14
-            | KeyCode::F15
-            | KeyCode::F16
-            | KeyCode::F17
-            | KeyCode::F18
-            | KeyCode::F19
-            | KeyCode::F20
-            | KeyCode::F21
-            | KeyCode::F22
-            | KeyCode::F23
-            | KeyCode::F24 => return None, // Not all F-keys map cleanly
-            KeyCode::MediaNext
-            | KeyCode::MediaPrev
-            | KeyCode::MediaPlayPause
-            | KeyCode::MediaStop
-            | KeyCode::VolumeUp
-            | KeyCode::VolumeDown
-            | KeyCode::VolumeMute => return None,
-            KeyCode::Other(_) => return None,
+            KeyCode::F13 | KeyCode::F14 | KeyCode::F15 | KeyCode::F16
+            | KeyCode::F17 | KeyCode::F18 | KeyCode::F19 | KeyCode::F20
+            | KeyCode::F21 | KeyCode::F22 | KeyCode::F23 | KeyCode::F24
+            | KeyCode::MediaNext | KeyCode::MediaPrev | KeyCode::MediaPlayPause
+            | KeyCode::MediaStop | KeyCode::VolumeUp | KeyCode::VolumeDown
+            | KeyCode::VolumeMute | KeyCode::Other(_) => return None,
         })
-    }
-
-    /// Detect edge hits using evdev RELATIVE event patterns.
-    /// Works on both X11 and Wayland without querying the display server.
-    ///
-    /// When the cursor hits the screen edge, the display server clamps it,
-    /// but the physical mouse can keep moving. This produces a sustained
-    /// stream of same-direction REL events. We detect this "pushing against
-    /// the wall" pattern by counting consecutive same-sign values.
-    ///
-    /// For ABSOLUTE devices (touchpads), we use direct position comparison.
-    struct EdgeDetector {
-        /// Consecutive positive (rightward) REL_X events
-        right_streak: u32,
-        /// Consecutive negative (leftward) REL_X events
-        left_streak: u32,
-        /// Events of same sign needed to trigger
-        threshold: u32,
-        /// Whether we're currently in "pushing" state (prevents re-trigger)
-        was_right_edge: bool,
-        was_left_edge: bool,
-    }
-
-    impl EdgeDetector {
-        fn new(threshold: u32) -> Self {
-            Self {
-                right_streak: 0,
-                left_streak: 0,
-                threshold,
-                was_right_edge: false,
-                was_left_edge: false,
-            }
-        }
-
-        /// Feed a REL_X value. Returns `Some(true)` if right edge hit,
-        /// `Some(false)` if left edge hit, `None` otherwise.
-        fn feed_rel_x(&mut self, value: i32) -> Option<bool> {
-            if value > 0 {
-                self.right_streak += 1;
-                self.left_streak = 0;
-                if self.right_streak >= self.threshold && !self.was_right_edge {
-                    self.was_right_edge = true;
-                    self.was_left_edge = false;
-                    return Some(true);
-                }
-            } else if value < 0 {
-                self.left_streak += 1;
-                self.right_streak = 0;
-                if self.left_streak >= self.threshold && !self.was_left_edge {
-                    self.was_left_edge = true;
-                    self.was_right_edge = false;
-                    return Some(false);
-                }
-            } else {
-                // Zero value — no movement, don't reset streaks (mouse paused at edge)
-            }
-            None
-        }
-
-        fn reset(&mut self) {
-            self.right_streak = 0;
-            self.left_streak = 0;
-            self.was_right_edge = false;
-            self.was_left_edge = false;
-        }
-    }
-
-    /// Start evdev-based input capture on Linux.
-    /// No exclusive grab — the local cursor always works.
-    /// Mouse Without Borders style: move mouse to right edge to transition
-    /// to the remote machine; move to left edge to come back.
-    /// Edge detection uses velocity-pattern analysis on REL events
-    /// (works on X11 and Wayland alike).
-    pub fn start_capture(tx: mpsc::Sender<NetworkEvent>, screen_width: f64) {
-        eprintln!("[capture] start_capture called, screen_width={}", screen_width);
-        IS_REMOTE.store(false, Ordering::SeqCst);
-        STOP_FLAG.store(false, Ordering::SeqCst);
-
-        let is_remote = IS_REMOTE.clone();
-        let stop_flag = STOP_FLAG.clone();
-
-        std::thread::spawn(move || {
-            let devices = find_input_devices();
-            eprintln!("[capture] find_input_devices returned {} device(s)", devices.len());
-            if devices.is_empty() {
-                eprintln!("[capture] NO devices found — capture thread exiting!");
-                return;
-            }
-
-            let mut opened_devices: Vec<Device> = Vec::new();
-            for path in &devices {
-                match Device::open(path) {
-                    Ok(device) => {
-                        eprintln!("[capture] opened: {}", device.name().unwrap_or("unknown"));
-                        opened_devices.push(device);
-                    }
-                    Err(e) => {
-                        eprintln!("[capture] failed to open {:?}: {}", path, e);
-                    }
-                }
-            }
-
-            if opened_devices.is_empty() {
-                eprintln!("[capture] could not open any device — exiting");
-                return;
-            }
-
-            let mut edge_detector = EdgeDetector::new(3);
-            let edge_threshold = 5.0;
-            let mut last_abs_x = 0.0_f64;
-
-            eprintln!("[capture] entering event loop, {} devices, remote={}", opened_devices.len(), is_remote.load(Ordering::SeqCst));
-
-            loop {
-                if stop_flag.load(Ordering::SeqCst) {
-                    eprintln!("[capture] stop flag set, exiting");
-                    break;
-                }
-
-                for device in &mut opened_devices {
-                    match device.fetch_events() {
-                        Ok(events) => {
-                            for event in events {
-                                handle_evdev_event(
-                                    &event,
-                                    &tx,
-                                    &is_remote,
-                                    screen_width,
-                                    &mut edge_detector,
-                                    edge_threshold,
-                                    &mut last_abs_x,
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            if e.kind() != std::io::ErrorKind::WouldBlock {
-                                eprintln!("[capture] evdev fetch error: {}", e);
-                            }
-                            // WouldBlock = no events pending, continue to next device
-                        }
-                    }
-                }
-
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-        });
-    }
-
-    fn handle_evdev_event(
-        event: &InputEvent,
-        tx: &mpsc::Sender<NetworkEvent>,
-        is_remote: &AtomicBool,
-        screen_width: f64,
-        edge: &mut EdgeDetector,
-        edge_threshold: f64,
-        last_abs_x: &mut f64,
-    ) {
-        let currently_remote = is_remote.load(Ordering::SeqCst);
-
-        match event.event_type() {
-            EventType::RELATIVE => {
-                let value = event.value();
-                match event.code() {
-                    0 => {
-                        if let Some(is_right) = edge.feed_rel_x(value) {
-                            if is_right && !currently_remote {
-                                is_remote.store(true, Ordering::SeqCst);
-                                eprintln!("[capture] REMOTE ON (REL right edge)");
-                            } else if !is_right && currently_remote {
-                                is_remote.store(false, Ordering::SeqCst);
-                                eprintln!("[capture] REMOTE OFF (REL left edge)");
-                            }
-                        }
-                        let remote_now = is_remote.load(Ordering::SeqCst);
-                        if remote_now {
-                            match tx.blocking_send(NetworkEvent::MouseMoveRelative(value as f64, 0.0)) {
-                                Ok(()) => eprintln!("[capture] sent REL_X={}", value),
-                                Err(e) => eprintln!("[capture] REL_X send FAILED: {:?}", e),
-                            }
-                        }
-                    }
-                    1 => {
-                        let remote_now = is_remote.load(Ordering::SeqCst);
-                        if remote_now {
-                            match tx.blocking_send(NetworkEvent::MouseMoveRelative(0.0, value as f64)) {
-                                Ok(()) => eprintln!("[capture] sent REL_Y={}", value),
-                                Err(e) => eprintln!("[capture] REL_Y send FAILED: {:?}", e),
-                            }
-                        }
-                    }
-                    8 => {
-                        let remote_now = is_remote.load(Ordering::SeqCst);
-                        if remote_now {
-                            match tx.blocking_send(NetworkEvent::MouseScroll(0, value)) {
-                                Ok(()) => eprintln!("[capture] sent WHEEL={}", value),
-                                Err(e) => eprintln!("[capture] WHEEL send FAILED: {:?}", e),
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            EventType::ABSOLUTE => {
-                let val = event.value() as f64;
-                match event.code() {
-                    0 => {
-                        *last_abs_x = val;
-                        if !currently_remote && val >= screen_width - edge_threshold {
-                            is_remote.store(true, Ordering::SeqCst);
-                            edge.reset();
-                            eprintln!("[capture] REMOTE ON (ABS X {:.0})", val);
-                        } else if currently_remote && val <= edge_threshold {
-                            is_remote.store(false, Ordering::SeqCst);
-                            edge.reset();
-                            eprintln!("[capture] REMOTE OFF (ABS X {:.0})", val);
-                        }
-                        let remote_now = is_remote.load(Ordering::SeqCst);
-                        if remote_now {
-                            match tx.blocking_send(NetworkEvent::MouseMoved(val, *last_abs_x)) {
-                                Ok(()) => eprintln!("[capture] sent ABS_X={:.0}", val),
-                                Err(e) => eprintln!("[capture] ABS_X send FAILED: {:?}", e),
-                            }
-                        }
-                    }
-                    1 => {
-                        let remote_now = is_remote.load(Ordering::SeqCst);
-                        if remote_now {
-                            match tx.blocking_send(NetworkEvent::MouseMoved(*last_abs_x, val)) {
-                                Ok(()) => eprintln!("[capture] sent ABS_Y={:.0}", val),
-                                Err(e) => eprintln!("[capture] ABS_Y send FAILED: {:?}", e),
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            EventType::KEY => {
-                let key = EvdevKey::new(event.code());
-                let pressed = event.value() != 0;
-                let remote_now = is_remote.load(Ordering::SeqCst);
-
-                if remote_now {
-                    if let Some(kc) = evdev_key_to_keycode(key) {
-                        eprintln!("[capture] key {:?} pressed={}", kc, pressed);
-                        if pressed {
-                            match tx.blocking_send(NetworkEvent::KeyDown(kc)) {
-                                Ok(()) => eprintln!("[capture] sent KeyDown"),
-                                Err(e) => eprintln!("[capture] KeyDown send FAILED: {:?}", e),
-                            }
-                        } else {
-                            match tx.blocking_send(NetworkEvent::KeyUp(kc)) {
-                                Ok(()) => eprintln!("[capture] sent KeyUp"),
-                                Err(e) => eprintln!("[capture] KeyUp send FAILED: {:?}", e),
-                            }
-                        }
-                    } else {
-                        eprintln!("[capture] key code {} unmapped", event.code());
-                    }
-                }
-            }
-            EventType::SYNCHRONIZATION => {}
-            _ => {}
-        }
-    }
-
-    /// Start input simulation on Linux using uinput virtual devices.
-    pub async fn start_simulation(mut rx: mpsc::Receiver<NetworkEvent>) {
-        eprintln!("[simulation] start_simulation called");
-        let mut uinput_dev = match create_uinput_device() {
-            Some(d) => d,
-            None => {
-                eprintln!("[simulation] FAILED to create uinput device — check /dev/uinput permissions!");
-                return;
-            }
-        };
-        eprintln!("[simulation] uinput device created, waiting for events...");
-
-        while let Some(event) = rx.recv().await {
-            eprintln!("[simulation] received: {:?}", event);
-            match event {
-                NetworkEvent::MouseMoved(x, y) => {
-                    let _ = uinput_dev.emit(&[
-                        InputEvent::new(EventType::ABSOLUTE, 0, x as i32), // ABS_X
-                        InputEvent::new(EventType::ABSOLUTE, 1, y as i32), // ABS_Y
-                        InputEvent::new(EventType::SYNCHRONIZATION, 0, 0), // SYN_REPORT
-                    ]);
-                }
-                NetworkEvent::MouseMoveRelative(dx, dy) => {
-                    let _ = uinput_dev.emit(&[
-                        InputEvent::new(EventType::RELATIVE, 0, dx as i32), // REL_X
-                        InputEvent::new(EventType::RELATIVE, 1, dy as i32), // REL_Y
-                        InputEvent::new(EventType::SYNCHRONIZATION, 0, 0),
-                    ]);
-                }
-                NetworkEvent::MouseButtonDown(btn) => {
-                    let code = mousebutton_to_evdev_code(&btn);
-                    let _ = uinput_dev.emit(&[
-                        InputEvent::new(EventType::KEY, code, 1),
-                        InputEvent::new(EventType::SYNCHRONIZATION, 0, 0),
-                    ]);
-                }
-                NetworkEvent::MouseButtonUp(btn) => {
-                    let code = mousebutton_to_evdev_code(&btn);
-                    let _ = uinput_dev.emit(&[
-                        InputEvent::new(EventType::KEY, code, 0),
-                        InputEvent::new(EventType::SYNCHRONIZATION, 0, 0),
-                    ]);
-                }
-                NetworkEvent::MouseScroll(_dx, dy) => {
-                    let _ = uinput_dev.emit(&[
-                        InputEvent::new(EventType::RELATIVE, 8, dy), // REL_WHEEL
-                        InputEvent::new(EventType::SYNCHRONIZATION, 0, 0),
-                    ]);
-                }
-                NetworkEvent::KeyDown(kc) => {
-                    if let Some(ev) = keycode_to_evdev_key(&kc) {
-                        let _ = uinput_dev.emit(&[
-                            InputEvent::new(EventType::KEY, ev.code(), 1),
-                            InputEvent::new(EventType::SYNCHRONIZATION, 0, 0),
-                        ]);
-                    }
-                }
-                NetworkEvent::KeyUp(kc) => {
-                    if let Some(ev) = keycode_to_evdev_key(&kc) {
-                        let _ = uinput_dev.emit(&[
-                            InputEvent::new(EventType::KEY, ev.code(), 0),
-                            InputEvent::new(EventType::SYNCHRONIZATION, 0, 0),
-                        ]);
-                    }
-                }
-                _ => {}
-            }
-        }
     }
 
     fn mousebutton_to_evdev_code(btn: &MouseButton) -> u16 {
         match btn {
-            MouseButton::Left => 0x110,   // BTN_LEFT
-            MouseButton::Right => 0x111,  // BTN_RIGHT
-            MouseButton::Middle => 0x112, // BTN_MIDDLE
-            MouseButton::X1 => 0x113,     // BTN_SIDE
-            MouseButton::X2 => 0x114,     // BTN_EXTRA
+            MouseButton::Left => 0x110,
+            MouseButton::Right => 0x111,
+            MouseButton::Middle => 0x112,
+            MouseButton::X1 => 0x113,
+            MouseButton::X2 => 0x114,
         }
     }
 
