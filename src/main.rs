@@ -1,15 +1,40 @@
 #![warn(clippy::all, rust_2018_idioms)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod capture;
-mod clipboard;
-mod network;
-
-use eframe::egui::{self, ColorImage, TextureHandle};
+use eframe::egui::{self, Color32, ColorImage, IconData};
+use egui_shadcn::{
+    BadgeProps, BadgeVariant, CardProps, SeparatorProps,
+    badge::badge,
+    button::{Button, ButtonSize, ButtonVariant},
+    card::card,
+    input::Input,
+    label::Label,
+    separator::separator,
+    theme::Theme,
+    tokens::ColorPalette,
+    typography::{
+        HeadingAs, HeadingProps, TextProps, TypographyColor, heading, text,
+    },
+};
+use freemouse::{capture, clipboard, network};
 use rand::Rng;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::mpsc;
+
+// ── Theme colors from design spec ────────────────────────────────────
+
+const BG_PRIMARY: Color32 = Color32::from_rgb(7, 9, 13);
+const BG_SECONDARY: Color32 = Color32::from_rgb(15, 19, 27);
+const BG_CARD: Color32 = Color32::from_rgb(17, 21, 29);
+const TEXT_PRIMARY: Color32 = Color32::from_rgb(245, 247, 250);
+const TEXT_SECONDARY: Color32 = Color32::from_rgb(163, 172, 185);
+const TEXT_MUTED: Color32 = Color32::from_rgb(107, 114, 128);
+const ACCENT_PRIMARY: Color32 = Color32::from_rgb(124, 77, 255);
+const ACCENT_GREEN: Color32 = Color32::from_rgb(34, 197, 94);
+const DANGER: Color32 = Color32::from_rgb(239, 68, 68);
+const BORDER: Color32 = Color32::from_rgb(31, 36, 48);
+const INPUT_BG: Color32 = Color32::from_rgb(13, 17, 23);
 
 #[derive(PartialEq, Clone)]
 enum AppMode {
@@ -25,14 +50,46 @@ struct CheckResult {
     detail: String,
 }
 
-struct CheckResults {
-    checks: Vec<CheckResult>,
+fn custom_theme() -> Theme {
+    Theme::new(ColorPalette {
+        background: BG_PRIMARY,
+        foreground: TEXT_PRIMARY,
+        card: BG_CARD,
+        card_foreground: TEXT_PRIMARY,
+        popover: BG_CARD,
+        popover_foreground: TEXT_PRIMARY,
+        border: BORDER,
+        input: INPUT_BG,
+        ring: ACCENT_PRIMARY,
+        primary: ACCENT_PRIMARY,
+        primary_foreground: Color32::WHITE,
+        secondary: Color32::from_rgb(26, 31, 43),
+        secondary_foreground: TEXT_PRIMARY,
+        accent: ACCENT_PRIMARY,
+        accent_foreground: Color32::WHITE,
+        muted: Color32::from_rgb(31, 36, 48),
+        muted_foreground: TEXT_MUTED,
+        destructive: DANGER,
+        destructive_foreground: Color32::WHITE,
+        chart_1: ACCENT_PRIMARY,
+        chart_2: ACCENT_GREEN,
+        chart_3: Color32::from_rgb(255, 183, 77),
+        chart_4: Color32::from_rgb(100, 181, 246),
+        chart_5: Color32::from_rgb(206, 147, 216),
+        sidebar: BG_SECONDARY,
+        sidebar_foreground: TEXT_PRIMARY,
+        sidebar_primary: ACCENT_PRIMARY,
+        sidebar_primary_foreground: Color32::WHITE,
+        sidebar_accent: ACCENT_PRIMARY,
+        sidebar_accent_foreground: Color32::WHITE,
+        sidebar_border: BORDER,
+        sidebar_ring: ACCENT_PRIMARY,
+    })
 }
 
 fn run_permission_checks() -> Vec<CheckResult> {
     let mut checks = Vec::new();
 
-    // Check 1: evdev access on Linux
     #[cfg(target_os = "linux")]
     {
         let input_dir = std::path::Path::new("/dev/input");
@@ -52,28 +109,25 @@ fn run_permission_checks() -> Vec<CheckResult> {
                         if path.file_name().and_then(|n| n.to_str()).unwrap_or("").starts_with("event") {
                             found_any = true;
                             match std::fs::metadata(&path) {
-                                Ok(_) => {
-                                    // Try opening for read
-                                    match std::fs::File::open(&path) {
-                                        Ok(_) => {
-                                            checks.push(CheckResult {
-                                                name: "Input devices",
-                                                pass: true,
-                                                detail: "evdev devices accessible.".into(),
-                                            });
-                                        }
-                                        Err(_) => {
-                                            checks.push(CheckResult {
-                                                name: "Input devices (Permissions)",
-                                                pass: false,
-                                                detail: format!(
-                                                    "Cannot read {:?}.\nRun: sudo usermod -aG input $USER\nThen log out and back in.",
-                                                    path
-                                                ),
-                                            });
-                                        }
+                                Ok(_) => match std::fs::File::open(&path) {
+                                    Ok(_) => {
+                                        checks.push(CheckResult {
+                                            name: "Input devices",
+                                            pass: true,
+                                            detail: "evdev devices accessible.".into(),
+                                        });
                                     }
-                                }
+                                    Err(_) => {
+                                        checks.push(CheckResult {
+                                            name: "Input devices (Permissions)",
+                                            pass: false,
+                                            detail: format!(
+                                                "Cannot read {:?}.\nRun: sudo usermod -aG input $USER\nThen log out and back in.",
+                                                path
+                                            ),
+                                        });
+                                    }
+                                },
                                 Err(_) => {}
                             }
                             break;
@@ -107,7 +161,6 @@ fn run_permission_checks() -> Vec<CheckResult> {
         });
     }
 
-    // Check 2: Port availability
     {
         match std::net::TcpListener::bind("0.0.0.0:4444") {
             Ok(_) => {
@@ -127,7 +180,6 @@ fn run_permission_checks() -> Vec<CheckResult> {
         }
     }
 
-    // Check 3: Screen size detected
     {
         let (w, h) = capture::get_screen_size();
         if w > 0.0 && h > 0.0 {
@@ -150,7 +202,7 @@ fn run_permission_checks() -> Vec<CheckResult> {
 
 struct FreemouseApp {
     mode: AppMode,
-    logo_texture: Option<TextureHandle>,
+    logo_texture: Option<egui::TextureHandle>,
     ip_string: String,
     pin_string: String,
     connection_status: Arc<Mutex<String>>,
@@ -159,14 +211,12 @@ struct FreemouseApp {
     discovered_servers: Vec<String>,
     discovered_raw: Vec<network::DiscoveredServer>,
     screen_width: f64,
-    screen_height: f64,
     _discovery_rx: Option<mpsc::Receiver<network::DiscoveredServer>>,
-    permission_checks: CheckResults,
 }
 
 impl Default for FreemouseApp {
     fn default() -> Self {
-        let (sw, sh) = capture::get_screen_size();
+        let (sw, _) = capture::get_screen_size();
         let checks = run_permission_checks();
         let all_pass = checks.iter().all(|c| c.pass);
         Self {
@@ -180,570 +230,627 @@ impl Default for FreemouseApp {
             discovered_servers: Vec::new(),
             discovered_raw: Vec::new(),
             screen_width: sw,
-            screen_height: sh,
             _discovery_rx: None,
-            permission_checks: CheckResults { checks },
         }
     }
 }
 
 impl eframe::App for FreemouseApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let theme = custom_theme();
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(BG_PRIMARY))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    // ── header ────────────────────────────────────
+                    ui.add_space(32.0);
+                    ui.vertical(|ui| {
+                        heading(ui, &theme, HeadingProps::new("Freemouse").size(30.0));
+                        ui.add_space(4.0);
+                        text(ui, &theme, TextProps::new("Mouse, Keyboard & Clipboard Sharing").size(15.0).color(TypographyColor::Muted));
+                    });
+
+                    ui.add_space(24.0);
+
+                    // ── page content ──────────────────────────────
+                    match self.mode.clone() {
+                        AppMode::Onboarding => self.render_onboarding(ui, &theme),
+                        AppMode::Home => self.render_home(ui, &theme),
+                        AppMode::Share(pin) => self.render_share(ui, &theme, &pin),
+                        AppMode::Receive => self.render_receive(ui, &theme),
+                    }
+
+                    // ── footer ────────────────────────────────────
+                    ui.add_space(32.0);
+                    separator(ui, &theme, SeparatorProps::default());
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        footer_badge(ui, &theme, "Secure");
+                        ui.add_space(16.0);
+                        footer_badge(ui, &theme, "Local Network");
+                        ui.add_space(16.0);
+                        footer_badge(ui, &theme, "Encrypted");
+                    });
+                    ui.add_space(8.0);
+                });
+            });
+
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+    }
+}
+
+fn footer_badge(ui: &mut egui::Ui, theme: &Theme, label: &str) {
+    badge(ui, theme, BadgeProps::new(label).variant(BadgeVariant::Outline).color(ACCENT_GREEN));
+}
+
+impl FreemouseApp {
+    fn render_onboarding(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        ui.add_space(24.0);
+        if let Some(tex) = &self.logo_texture {
+            ui.add(egui::Image::new(tex).max_height(96.0));
+            ui.add_space(12.0);
+        }
+
+        heading(ui, theme, HeadingProps::new("Welcome to Freemouse").as_tag(HeadingAs::H3));
+        text(ui, theme, TextProps::new("Mouse, Keyboard & Clipboard Sharing").color(TypographyColor::Muted));
+        ui.add_space(20.0);
+
+        heading(ui, theme, HeadingProps::new("System Checks").as_tag(HeadingAs::H4));
+        ui.add_space(8.0);
+
+        let all_pass = true;
+
+        for check in &run_permission_checks() {
+            card(ui, theme, CardProps::default(), |ui| {
+                ui.horizontal(|ui| {
+                    let badge_props = if check.pass {
+                        BadgeProps::new("✓").variant(BadgeVariant::Default)
+                    } else {
+                        BadgeProps::new("✗").variant(BadgeVariant::Destructive)
+                    };
+                    badge(ui, theme, badge_props);
+                    ui.add_space(8.0);
+                    ui.vertical(|ui| {
+                        Label::new(check.name).show(ui, theme);
+                        if !check.pass {
+                            text(ui, theme, TextProps::new(&check.detail).color(TypographyColor::Muted));
+                        }
+                    });
+                });
+            });
+            ui.add_space(4.0);
+        }
+
+        ui.add_space(20.0);
+
+        if all_pass {
+            text(ui, theme, TextProps::new("All checks passed! You're ready to go."));
+            ui.add_space(12.0);
+            if Button::new("Let's go!").show(ui, theme).clicked() {
+                self.mode = AppMode::Home;
+            }
+        } else {
+            text(ui, theme, TextProps::new("Some checks failed. Please fix the issues above."));
+            ui.add_space(8.0);
+            if Button::new("Continue anyway")
+                .variant(ButtonVariant::Outline)
+                .show(ui, theme)
+                .clicked()
+            {
+                self.mode = AppMode::Home;
+            }
+        }
+    }
+
+    fn render_home(&mut self, ui: &mut egui::Ui, theme: &Theme) {
+        ui.add_space(8.0);
+
+        let w = ui.available_width();
+        let card_w = (w - 16.0) / 2.0;
+        let card_h = 200.0;
+
+        ui.horizontal(|ui| {
+            // ── Share card ───────────────────────────────────────
+            ui.allocate_ui_with_layout(
+                egui::vec2(card_w, card_h),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    card(ui, theme, CardProps::default(), |ui| {
+                        ui.add_space(16.0);
+                        let (icon_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(48.0, 48.0),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter();
+                        painter.rect_filled(
+                            icon_rect,
+                            12.0,
+                            Color32::from_rgba_premultiplied(42, 31, 82, 255),
+                        );
+                        painter.text(
+                            icon_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "📤",
+                            egui::FontId::proportional(22.0),
+                            TEXT_PRIMARY,
+                        );
+                        ui.add_space(8.0);
+                        ui.vertical_centered(|ui| {
+                            heading(ui, theme, HeadingProps::new("Share").size(18.0));
+                            ui.add_space(4.0);
+                            text(ui, theme, TextProps::new("Share your mouse & keyboard with another computer").size(14.0).color(TypographyColor::Muted));
+                            ui.add_space(12.0);
+                            if Button::new("Start Sharing")
+                                .size(ButtonSize::Lg)
+                                .show(ui, theme)
+                                .clicked()
+                            {
+                                capture::os::stop_capture();
+                                let pin = format!("{:06}", rand::thread_rng().gen_range(0..999999));
+                                self.mode = AppMode::Share(pin.clone());
+                                *self.connection_status.lock().unwrap() =
+                                    "Waiting for connection...".to_string();
+
+                                let status_clone = self.connection_status.clone();
+                                let ctx_clone = ui.ctx().clone();
+                                let pin_clone = pin.clone();
+                                let sw = self.screen_width;
+
+                                std::thread::spawn(move || {
+                                    let rt = tokio::runtime::Runtime::new().unwrap();
+                                    rt.block_on(network::start_discovery_broadcast(4444));
+                                });
+
+                                self.server_task = Some(std::thread::spawn(move || {
+                                    let rt = match tokio::runtime::Runtime::new() {
+                                        Ok(rt) => rt,
+                                        Err(e) => {
+                                            *status_clone.lock().unwrap() =
+                                                format!("Runtime Error: {}", e);
+                                            ctx_clone.request_repaint();
+                                            return;
+                                        }
+                                    };
+                                    rt.block_on(async {
+                                        match network::start_server(4444, &pin_clone).await {
+                                            Ok(conn) => {
+                                                *status_clone.lock().unwrap() =
+                                                    "Connected!".to_string();
+                                                ctx_clone.request_repaint();
+
+                                                let (tx, rx) =
+                                                    mpsc::channel::<network::NetworkEvent>(100);
+
+                                                capture::os::start_capture(tx.clone(), sw);
+                                                clipboard::start_clipboard_monitor(tx);
+
+                                                network::run_share_loop(conn, rx).await;
+
+                                                *status_clone.lock().unwrap() =
+                                                    "Disconnected".to_string();
+                                                ctx_clone.request_repaint();
+                                            }
+                                            Err(e) => {
+                                                *status_clone.lock().unwrap() =
+                                                    format!("Error: {}", e);
+                                                ctx_clone.request_repaint();
+                                            }
+                                        }
+                                    });
+                                }));
+                            }
+                        });
+                    });
+                },
+            );
+
+            ui.add_space(16.0);
+
+            // ── Receive card ─────────────────────────────────────
+            ui.allocate_ui_with_layout(
+                egui::vec2(card_w, card_h),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    card(ui, theme, CardProps::default(), |ui| {
+                        ui.add_space(16.0);
+                        let (icon_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(48.0, 48.0),
+                            egui::Sense::hover(),
+                        );
+                        let painter = ui.painter();
+                        painter.rect_filled(
+                            icon_rect,
+                            12.0,
+                            Color32::from_rgba_premultiplied(21, 56, 40, 255),
+                        );
+                        painter.text(
+                            icon_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "📥",
+                            egui::FontId::proportional(22.0),
+                            TEXT_PRIMARY,
+                        );
+                        ui.add_space(8.0);
+                        ui.vertical_centered(|ui| {
+                            heading(ui, theme, HeadingProps::new("Receive").size(18.0));
+                            ui.add_space(4.0);
+                            text(ui, theme, TextProps::new("Take control of another computer's mouse & keyboard").size(14.0).color(TypographyColor::Muted));
+                            ui.add_space(12.0);
+                            if Button::new("Start Receiving")
+                                .size(ButtonSize::Lg)
+                                .show(ui, theme)
+                                .clicked()
+                            {
+                                self.client_task = None;
+                                capture::os::stop_capture();
+                                self.mode = AppMode::Receive;
+                                *self.connection_status.lock().unwrap() =
+                                    "Scanning network...".to_string();
+                                let rx = network::start_discovery_listener();
+                                self._discovery_rx = Some(rx);
+                                *self.connection_status.lock().unwrap() =
+                                    "Enter details or pick a discovered server.".to_string();
+                            }
+                        });
+                    });
+                },
+            );
+        });
+    }
+
+    fn render_share(&mut self, ui: &mut egui::Ui, theme: &Theme, pin: &str) {
+        let status = if let Ok(lock) = self.connection_status.try_lock() {
+            lock.clone()
+        } else {
+            "...".to_string()
+        };
+        let local_ip = local_ip_address::local_ip()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|_| "Unknown IP".to_string());
+
+        // Back button
+        ui.horizontal(|ui| {
+            if Button::new("← Back")
+                .variant(ButtonVariant::Outline)
+                .show(ui, theme)
+                .clicked()
+            {
+                self.server_task = None;
+                capture::os::stop_capture();
+                self.mode = AppMode::Home;
+                *self.connection_status.lock().unwrap() = "Ready".to_string();
+            }
+        });
+
+        ui.add_space(16.0);
+
+        // Status chip
+        if status.contains("Connected") {
+            badge(ui, theme, BadgeProps::new("Connected").variant(BadgeVariant::Default).color(ACCENT_GREEN));
+        } else {
+            badge(ui, theme, BadgeProps::new("Waiting for connection...").variant(BadgeVariant::Secondary));
+        }
+
+        ui.add_space(16.0);
+
+        // Connection details card
+        card(ui, theme, CardProps::default(), |ui| {
+            ui.horizontal(|ui| {
+                let icon_rect = egui::Rect::from_min_size(
+                    ui.cursor().min,
+                    egui::vec2(36.0, 36.0),
+                );
+                let painter = ui.painter();
+                painter.rect_filled(icon_rect, 10.0, Color32::from_rgba_premultiplied(34, 26, 70, 255));
+                painter.text(icon_rect.center(), egui::Align2::CENTER_CENTER, "🖥", egui::FontId::proportional(16.0), TEXT_PRIMARY);
+                ui.add_space(44.0);
+                heading(ui, theme, HeadingProps::new("Connection Details").size(18.0));
+            });
+            ui.add_space(12.0);
+
+            separator(ui, theme, SeparatorProps::default());
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                text(ui, theme, TextProps::new("IP Address").size(14.0).color(TypographyColor::Muted));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    Label::new(&local_ip).show(ui, theme);
+                });
+            });
+            ui.add_space(4.0);
+            separator(ui, theme, SeparatorProps::default());
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                text(ui, theme, TextProps::new("PIN Code").size(14.0).color(TypographyColor::Muted));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    Label::new(pin).show(ui, theme);
+                });
+            });
+        });
+
+        ui.add_space(16.0);
+
+        // Info card
+        card(ui, theme, CardProps::default(), |ui| {
+            ui.horizontal(|ui| {
+                let icon_rect = egui::Rect::from_min_size(
+                    ui.cursor().min,
+                    egui::vec2(36.0, 36.0),
+                );
+                let painter = ui.painter();
+                painter.rect_filled(icon_rect, 10.0, Color32::from_rgba_premultiplied(34, 26, 70, 255));
+                painter.text(icon_rect.center(), egui::Align2::CENTER_CENTER, "👥", egui::FontId::proportional(16.0), TEXT_PRIMARY);
+                ui.add_space(44.0);
+                ui.vertical(|ui| {
+                    heading(ui, theme, HeadingProps::new("Waiting for connection...").size(18.0));
+                    text(ui, theme, TextProps::new("Another computer can now connect using the details above.").size(14.0).color(TypographyColor::Muted));
+                });
+            });
+        });
+
+        ui.add_space(24.0);
+
+        // Stop sharing button
+        if Button::new("■ Stop Sharing")
+            .variant(ButtonVariant::Destructive)
+            .show(ui, theme)
+            .clicked()
+        {
+            self.server_task = None;
+            capture::os::stop_capture();
+            self.mode = AppMode::Home;
+            *self.connection_status.lock().unwrap() = "Ready".to_string();
+        }
+    }
+
+    fn render_receive(&mut self, ui: &mut egui::Ui, theme: &Theme) {
         let status = if let Ok(lock) = self.connection_status.try_lock() {
             lock.clone()
         } else {
             "...".to_string()
         };
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered_justified(|ui| {
-                ui.add_space(20.0);
-                ui.heading(egui::RichText::new("Freemouse").size(32.0).strong());
-                ui.label(
-                    egui::RichText::new("Mouse, Keyboard & Clipboard Sharing")
-                        .size(14.0)
-                        .weak(),
-                );
-                ui.add_space(20.0);
+        // Back button
+        ui.horizontal(|ui| {
+            if Button::new("← Back")
+                .variant(ButtonVariant::Outline)
+                .show(ui, theme)
+                .clicked()
+            {
+                self.client_task = None;
+                capture::os::stop_capture();
+                self.mode = AppMode::Home;
+                self._discovery_rx = None;
+                self.discovered_servers.clear();
+                self.discovered_raw.clear();
+                *self.connection_status.lock().unwrap() = "Ready".to_string();
+            }
+        });
 
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Display: {:.0}x{:.0}",
-                        self.screen_width, self.screen_height
-                    ))
-                    .size(10.0)
-                    .weak(),
-                );
-                ui.add_space(10.0);
+        ui.add_space(16.0);
 
-                match self.mode.clone() {
-                    AppMode::Onboarding => { self.render_onboarding(ctx, ui); }
-                    AppMode::Home => {
-                        let card_frame = egui::Frame {
-                            fill: ctx.style().visuals.window_fill(),
-                            rounding: egui::Rounding::same(12.0),
-                            shadow: egui::epaint::Shadow {
-                offset: [0.0, 2.0].into(),
-                blur: 8.0,
-                spread: 0.0,
-                                color: egui::Color32::from_black_alpha(80),
-                            },
-                            ..Default::default()
-                        };
+        heading(ui, theme, HeadingProps::new("Connect to a Computer").size(18.0));
+        ui.add_space(16.0);
 
-                        ui.add_space(15.0);
-                        card_frame.show(ui, |ui| {
-                            ui.set_min_width(280.0);
-                            ui.set_max_width(320.0);
-                            ui.add_space(16.0);
-                            ui.vertical_centered(|ui| {
-                                ui.label(egui::RichText::new("📤").size(28.0));
-                                ui.add_space(4.0);
-                                ui.label(egui::RichText::new("Share").size(18.0).strong());
-                                ui.add_space(4.0);
-                                ui.label(
-                                    egui::RichText::new("Share your mouse & keyboard\nwith another computer")
-                                        .size(12.0)
-                                        .color(egui::Color32::GRAY),
-                                );
-                                ui.add_space(12.0);
-                                if ui
-                                    .add_sized(
-                                        egui::vec2(200.0, 44.0),
-                                        egui::Button::new(
-                                            egui::RichText::new("Start Sharing").size(16.0),
-                                        ),
-                                    )
-                                    .clicked()
-                                {
-                                    capture::os::stop_capture();
-                                    let pin = format!("{:06}", rand::thread_rng().gen_range(0..999999));
-                                    self.mode = AppMode::Share(pin.clone());
-                                    *self.connection_status.lock().unwrap() =
-                                        "Waiting for connection...".to_string();
+        // Poll discovered servers
+        if let Some(rx) = &mut self._discovery_rx {
+            while let Ok(server) = rx.try_recv() {
+                let display = format!("{} ({})", server.hostname, server.ip);
+                if !self.discovered_servers.contains(&display) {
+                    self.discovered_servers.push(display.clone());
+                    self.discovered_raw.push(server);
+                }
+            }
+        }
 
-                                    let status_clone = self.connection_status.clone();
-                                    let ctx_clone = ctx.clone();
-                                    let pin_clone = pin.clone();
-                                    let sw = self.screen_width;
-
-                                    std::thread::spawn(move || {
-                                        let rt = tokio::runtime::Runtime::new().unwrap();
-                                        rt.block_on(network::start_discovery_broadcast(4444));
-                                    });
-
-                                    self.server_task = Some(std::thread::spawn(move || {
-                                        let rt = match tokio::runtime::Runtime::new() {
-                                            Ok(rt) => rt,
-                                            Err(e) => {
-                                                *status_clone.lock().unwrap() =
-                                                    format!("Runtime Error: {}", e);
-                                                ctx_clone.request_repaint();
-                                                return;
-                                            }
-                                        };
-                                        rt.block_on(async {
-                                            match network::start_server(4444, &pin_clone).await {
-                                                Ok(conn) => {
-                                                    *status_clone.lock().unwrap() =
-                                                        "Connected!".to_string();
-                                                    ctx_clone.request_repaint();
-
-                                                    let (tx, rx) =
-                                                        mpsc::channel::<network::NetworkEvent>(100);
-
-                                                    capture::os::start_capture(tx.clone(), sw);
-                                                    clipboard::start_clipboard_monitor(tx);
-
-                                                    network::run_share_loop(conn, rx).await;
-
-                                                    *status_clone.lock().unwrap() =
-                                                        "Disconnected".to_string();
-                                                    ctx_clone.request_repaint();
-                                                }
-                                                Err(e) => {
-                                                    *status_clone.lock().unwrap() =
-                                                        format!("Error: {}", e);
-                                                    ctx_clone.request_repaint();
-                                                }
-                                            }
-                                        });
-                                    }));
-                                }
-                            });
-                            ui.add_space(16.0);
-                        });
-
-                        ui.add_space(16.0);
-
-                        card_frame.show(ui, |ui| {
-                            ui.set_min_width(280.0);
-                            ui.set_max_width(320.0);
-                            ui.add_space(16.0);
-                            ui.vertical_centered(|ui| {
-                                ui.label(egui::RichText::new("📥").size(28.0));
-                                ui.add_space(4.0);
-                                ui.label(egui::RichText::new("Receive").size(18.0).strong());
-                                ui.add_space(4.0);
-                                ui.label(
-                                    egui::RichText::new("Take control of another\ncomputer's mouse & keyboard")
-                                        .size(12.0)
-                                        .color(egui::Color32::GRAY),
-                                );
-                                ui.add_space(12.0);
-                                if ui
-                                    .add_sized(
-                                        egui::vec2(200.0, 44.0),
-                                        egui::Button::new(
-                                            egui::RichText::new("Start Receiving").size(16.0),
-                                        ),
-                                    )
-                                    .clicked()
-                                {
-                                    self.client_task = None;
-                                    capture::os::stop_capture();
-                                    self.mode = AppMode::Receive;
-                                    *self.connection_status.lock().unwrap() =
-                                        "Scanning network...".to_string();
-                                    let rx = network::start_discovery_listener();
-                                    self._discovery_rx = Some(rx);
-                                    *self.connection_status.lock().unwrap() =
-                                        "Enter details or pick a discovered server.".to_string();
-                                }
-                            });
-                            ui.add_space(16.0);
-                        });
-                    }
-                    AppMode::Share(pin) => {
-                        let local_ip = local_ip_address::local_ip()
-                            .map(|ip| ip.to_string())
-                            .unwrap_or_else(|_| "Unknown IP".to_string());
-
-                        ui.add_space(10.0);
-                        ui.label(egui::RichText::new("📤 Share Mode").size(24.0).strong());
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new("Share your mouse & keyboard with a remote computer")
-                                .size(12.0)
-                                .color(egui::Color32::GRAY),
-                        );
-                        ui.add_space(20.0);
-
-                        let info_frame = egui::Frame {
-                            fill: ctx.style().visuals.window_fill(),
-                            rounding: egui::Rounding::same(12.0),
-                            ..Default::default()
-                        };
-
-                        info_frame.show(ui, |ui| {
-                            ui.add_space(16.0);
-                            ui.vertical_centered(|ui| {
-                                ui.label(egui::RichText::new("Connection Details").size(16.0).strong());
-                                ui.add_space(12.0);
-
-                                ui.horizontal(|ui| {
-                                    ui.add_space(20.0);
-                                    ui.label(egui::RichText::new("IP Address").size(12.0).color(egui::Color32::GRAY));
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.add_space(20.0);
-                                        ui.label(
-                                            egui::RichText::new(&local_ip)
-                                                .color(egui::Color32::from_rgb(100, 200, 255))
-                                                .size(18.0)
-                                                .monospace(),
-                                        );
-                                    });
-                                });
-                                ui.add_space(8.0);
-                                ui.separator();
-                                ui.add_space(8.0);
-
-                                ui.horizontal(|ui| {
-                                    ui.add_space(20.0);
-                                    ui.label(egui::RichText::new("PIN Code").size(12.0).color(egui::Color32::GRAY));
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.add_space(20.0);
-                                        ui.label(
-                                            egui::RichText::new(&pin)
-                                                .color(egui::Color32::from_rgb(100, 220, 100))
-                                                .size(24.0)
-                                                .strong()
-                                                .monospace(),
-                                        );
-                                    });
-                                });
-                            });
-                            ui.add_space(16.0);
-                        });
-
-                        ui.add_space(16.0);
-
-                        let status_color = if status.contains("Connected") {
-                            egui::Color32::from_rgb(100, 220, 100)
-                        } else if status.contains("Error") {
-                            egui::Color32::from_rgb(240, 100, 100)
-                        } else {
-                            egui::Color32::GRAY
-                        };
-
-                        ui.horizontal(|ui| {
-                            ui.add_space(4.0);
-                            ui.label(egui::RichText::new("●").size(10.0).color(status_color));
-                            ui.add_space(4.0);
-                            ui.label(egui::RichText::new(&status).size(13.0).color(status_color));
-                        });
-
-                        ui.add_space(20.0);
-
-                        if ui
-                            .add_sized(
-                                egui::vec2(120.0, 36.0),
-                                egui::Button::new("← Back"),
-                            )
+        // Discovered servers card
+        if !self.discovered_servers.is_empty() {
+            card(ui, theme, CardProps::default(), |ui| {
+                ui.horizontal(|ui| {
+                    heading(ui, theme, HeadingProps::new("Discovered Servers").size(18.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if Button::new("⟳ Refresh")
+                            .variant(ButtonVariant::Secondary)
+                            .size(ButtonSize::Sm)
+                            .show(ui, theme)
                             .clicked()
                         {
-                            self.server_task = None;
-                            capture::os::stop_capture();
-                            self.mode = AppMode::Home;
-                            *self.connection_status.lock().unwrap() = "Ready".to_string();
-                        }
-                    }
-                    AppMode::Receive => {
-                        let info_frame = egui::Frame {
-                            fill: ctx.style().visuals.window_fill(),
-                            rounding: egui::Rounding::same(12.0),
-                            ..Default::default()
-                        };
-
-                        ui.add_space(10.0);
-                        ui.label(egui::RichText::new("📥 Receive Mode").size(24.0).strong());
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new("Connect to a remote computer to control it")
-                                .size(12.0)
-                                .color(egui::Color32::GRAY),
-                        );
-                        ui.add_space(20.0);
-
-                        // Poll for discovered servers
-                        if let Some(rx) = &mut self._discovery_rx {
-                            while let Ok(server) = rx.try_recv() {
-                                let display = format!("{} ({})", server.hostname, server.ip);
-                                if !self.discovered_servers.contains(&display) {
-                                    self.discovered_servers.push(display.clone());
-                                    self.discovered_raw.push(server);
-                                }
-                            }
-                        }
-
-                        if !self.discovered_servers.is_empty() {
-                            info_frame.show(ui, |ui| {
-                                ui.add_space(12.0);
-                                ui.vertical_centered(|ui| {
-                                    ui.label(egui::RichText::new("Discovered Servers").size(14.0).strong());
-                                });
-                                ui.add_space(8.0);
-                                for (i, _server_str) in self.discovered_servers.iter().enumerate() {
-                                    let selected = self.ip_string == self.discovered_raw[i].ip;
-                                    let bg = if selected {
-                                        egui::Color32::from_rgba_premultiplied(60, 120, 200, 40)
-                                    } else {
-                                        egui::Color32::TRANSPARENT
-                                    };
-                                    let response = egui::Frame::none()
-                                        .fill(bg)
-                                        .rounding(egui::Rounding::same(6.0))
-                                        .show(ui, |ui| {
-                                            ui.set_min_width(280.0);
-                                            ui.add_space(8.0);
-                                            ui.horizontal(|ui| {
-                                                ui.add_space(12.0);
-                                                ui.label(
-                                                    egui::RichText::new("💻").size(18.0),
-                                                );
-                                                ui.add_space(8.0);
-                                                ui.vertical(|ui| {
-                                                    ui.label(
-                                                        egui::RichText::new(&self.discovered_raw[i].hostname)
-                                                            .size(14.0)
-                                                            .strong(),
-                                                    );
-                                                    ui.label(
-                                                        egui::RichText::new(&self.discovered_raw[i].ip)
-                                                            .size(11.0)
-                                                            .color(egui::Color32::GRAY)
-                                                            .monospace(),
-                                                    );
-                                                });
-                                            });
-                                            ui.add_space(8.0);
-                                        });
-                                    if response.response.clicked() {
-                                        self.ip_string = self.discovered_raw[i].ip.clone();
-                                    }
-                                }
-                                ui.add_space(12.0);
-                            });
-                            ui.add_space(16.0);
-                        }
-
-                        info_frame.show(ui, |ui| {
-                            ui.add_space(16.0);
-                            ui.vertical_centered(|ui| {
-                                ui.label(egui::RichText::new("Manual Connection").size(14.0).strong());
-                            });
-                            ui.add_space(12.0);
-
-                            ui.horizontal(|ui| {
-                                ui.add_space(16.0);
-                                ui.label(egui::RichText::new("IP Address").size(12.0).color(egui::Color32::GRAY));
-                                ui.add_space(8.0);
-                            });
-                            ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                ui.add_space(16.0);
-                                ui.add_sized(
-                                    egui::vec2(ui.available_width() - 32.0, 28.0),
-                                    egui::TextEdit::singleline(&mut self.ip_string)
-                                        .hint_text("192.168.1.100"),
-                                );
-                            });
-                            ui.add_space(12.0);
-
-                            ui.horizontal(|ui| {
-                                ui.add_space(16.0);
-                                ui.label(egui::RichText::new("PIN Code").size(12.0).color(egui::Color32::GRAY));
-                                ui.add_space(8.0);
-                            });
-                            ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                ui.add_space(16.0);
-                                ui.add_sized(
-                                    egui::vec2(ui.available_width() - 32.0, 28.0),
-                                    egui::TextEdit::singleline(&mut self.pin_string)
-                                        .hint_text("000000")
-                                        .password(true),
-                                );
-                            });
-                            ui.add_space(16.0);
-                        });
-
-                        ui.add_space(16.0);
-
-                        if ui
-                            .add_enabled(
-                                !self.ip_string.is_empty() && !self.pin_string.is_empty(),
-                                egui::Button::new(
-                                    egui::RichText::new("🔗 Connect").size(16.0),
-                                ),
-                            )
-                            .clicked()
-                        {
-                            self.client_task = None;
-                            *self.connection_status.lock().unwrap() = "Connecting...".to_string();
-                            let ip = self.ip_string.clone();
-                            let pin = self.pin_string.clone();
-                            let status_clone = self.connection_status.clone();
-                            let ctx_clone = ctx.clone();
-                            self._discovery_rx = None;
-
-                            self.client_task = Some(std::thread::spawn(move || {
-                                let rt = tokio::runtime::Runtime::new().unwrap();
-                                rt.block_on(async {
-                                    match network::start_client(&ip, 4444, &pin).await {
-                                        Ok(conn) => {
-                                            *status_clone.lock().unwrap() =
-                                                "Connected Successfully!".to_string();
-                                            ctx_clone.request_repaint();
-
-                                            let (tx, rx) =
-                                                mpsc::channel::<network::NetworkEvent>(100);
-
-                                            let rt2 = tokio::runtime::Runtime::new().unwrap();
-                                            rt2.spawn(capture::os::start_simulation(rx));
-
-                                            network::run_receive_loop(conn, tx).await;
-
-                                            *status_clone.lock().unwrap() =
-                                                "Disconnected".to_string();
-                                            ctx_clone.request_repaint();
-                                        }
-                                        Err(e) => {
-                                            *status_clone.lock().unwrap() =
-                                                format!("Connection Error: {}", e);
-                                            ctx_clone.request_repaint();
-                                        }
-                                    }
-                                });
-                            }));
-                        }
-
-                        ui.add_space(10.0);
-
-                        let status_color = if status.contains("Success") {
-                            egui::Color32::from_rgb(100, 220, 100)
-                        } else if status.contains("Error") {
-                            egui::Color32::from_rgb(240, 100, 100)
-                        } else {
-                            egui::Color32::GRAY
-                        };
-
-                        ui.horizontal(|ui| {
-                            ui.add_space(4.0);
-                            ui.label(egui::RichText::new("●").size(10.0).color(status_color));
-                            ui.add_space(4.0);
-                            ui.label(egui::RichText::new(&status).size(13.0).color(status_color));
-                        });
-
-                        ui.add_space(20.0);
-
-                        if ui
-                            .add_sized(
-                                egui::vec2(120.0, 36.0),
-                                egui::Button::new("← Back"),
-                            )
-                            .clicked()
-                        {
-                            self.client_task = None;
-                            capture::os::stop_capture();
-                            self.mode = AppMode::Home;
-                            self._discovery_rx = None;
+                            self._discovery_rx = Some(network::start_discovery_listener());
                             self.discovered_servers.clear();
                             self.discovered_raw.clear();
-                            *self.connection_status.lock().unwrap() = "Ready".to_string();
                         }
+                    });
+                });
+                ui.add_space(8.0);
+
+                for (i, _) in self.discovered_servers.iter().enumerate() {
+                    let selected = self.ip_string == self.discovered_raw[i].ip;
+                    let sense = egui::Sense::click();
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 52.0),
+                        sense,
+                    );
+                    let bg = if selected {
+                        Color32::from_rgba_premultiplied(60, 120, 200, 40)
+                    } else if response.hovered() {
+                        Color32::from_black_alpha(15)
+                    } else {
+                        Color32::TRANSPARENT
+                    };
+                    ui.painter().rect_filled(rect, 8.0, bg);
+
+                    // Icon circle
+                    let icon_c = egui::pos2(rect.left() + 26.0, rect.center().y);
+                    ui.painter().circle_filled(icon_c, 18.0, Color32::from_rgba_premultiplied(34, 26, 70, 255));
+                    ui.painter().text(icon_c, egui::Align2::CENTER_CENTER, "💻", egui::FontId::proportional(14.0), TEXT_PRIMARY);
+
+                    // Hostname
+                    ui.painter().text(
+                        egui::pos2(rect.left() + 56.0, rect.top() + 8.0),
+                        egui::Align2::LEFT_TOP,
+                        &self.discovered_raw[i].hostname,
+                        egui::FontId::proportional(14.0),
+                        TEXT_PRIMARY,
+                    );
+                    // IP
+                    ui.painter().text(
+                        egui::pos2(rect.left() + 56.0, rect.top() + 28.0),
+                        egui::Align2::LEFT_TOP,
+                        &self.discovered_raw[i].ip,
+                        egui::FontId::monospace(12.0),
+                        TEXT_MUTED,
+                    );
+                    // Chevron
+                    ui.painter().text(
+                        egui::pos2(rect.right() - 16.0, rect.center().y),
+                        egui::Align2::CENTER_CENTER,
+                        "›",
+                        egui::FontId::proportional(20.0),
+                        TEXT_SECONDARY,
+                    );
+
+                    if response.clicked() {
+                        self.ip_string = self.discovered_raw[i].ip.clone();
                     }
                 }
             });
+            ui.add_space(16.0);
+        }
+
+        // "or" separator
+        ui.horizontal(|ui| {
+            separator(ui, theme, SeparatorProps::default());
+            ui.add_space(8.0);
+            text(ui, theme, TextProps::new("or").color(TypographyColor::Muted));
+            ui.add_space(8.0);
+            separator(ui, theme, SeparatorProps::default());
         });
 
-        ctx.request_repaint_after(std::time::Duration::from_millis(500));
-    }
-}
+        ui.add_space(16.0);
 
-impl FreemouseApp {
-    fn render_onboarding(&mut self, _ctx: &egui::Context, ui: &mut egui::Ui) {
-        ui.add_space(30.0);
-
-        // Logo
-        if let Some(tex) = &self.logo_texture {
-            ui.add(egui::Image::new(tex).max_height(128.0));
-            ui.add_space(10.0);
-        }
-
-        ui.heading(egui::RichText::new("Welcome to Freemouse").size(28.0).strong());
-        ui.label(egui::RichText::new("Mouse, Keyboard & Clipboard Sharing").size(14.0).weak());
-        ui.add_space(20.0);
-
-        // Permission checks
-        ui.label(egui::RichText::new("System Checks").size(18.0).strong());
-        ui.separator();
-        ui.add_space(10.0);
-
-        let all_pass = self.permission_checks.checks.iter().all(|c| c.pass);
-
-        for check in &self.permission_checks.checks {
+        // Manual connection card
+        card(ui, theme, CardProps::default(), |ui| {
             ui.horizontal(|ui| {
-                let icon = if check.pass { "✓" } else { "✗" };
-                let color = if check.pass {
-                    egui::Color32::from_rgb(100, 220, 100)
-                } else {
-                    egui::Color32::from_rgb(240, 100, 100)
-                };
-                ui.label(egui::RichText::new(icon).size(18.0).color(color));
-                ui.label(egui::RichText::new(check.name).strong());
-            });
-
-            if !check.pass {
-                ui.add_space(2.0);
-                ui.label(
-                    egui::RichText::new(&check.detail)
-                        .size(11.0)
-                        .color(egui::Color32::GRAY),
+                let icon_rect = egui::Rect::from_min_size(
+                    ui.cursor().min,
+                    egui::vec2(36.0, 36.0),
                 );
-                ui.add_space(2.0);
-            }
-        }
+                let painter = ui.painter();
+                painter.rect_filled(icon_rect, 10.0, Color32::from_rgba_premultiplied(34, 26, 70, 255));
+                painter.text(icon_rect.center(), egui::Align2::CENTER_CENTER, "🔗", egui::FontId::proportional(16.0), TEXT_PRIMARY);
+                ui.add_space(44.0);
+                heading(ui, theme, HeadingProps::new("Manual Connection").size(18.0));
+            });
+            ui.add_space(16.0);
 
-        ui.add_space(20.0);
+            text(ui, theme, TextProps::new("IP Address").size(14.0).color(TypographyColor::Muted));
+            ui.add_space(4.0);
+            Input::new("ip_input")
+                .placeholder("192.168.1.100")
+                .width(ui.available_width())
+                .show(ui, theme, &mut self.ip_string);
 
-        if all_pass {
-            ui.label(
-                egui::RichText::new("All checks passed! You're ready to go.")
-                    .size(14.0)
-                    .color(egui::Color32::from_rgb(100, 220, 100)),
-            );
-            ui.add_space(15.0);
-            if ui
-                .add_sized(egui::vec2(120.0, 40.0), egui::Button::new("Let's go!"))
+            ui.add_space(12.0);
+
+            text(ui, theme, TextProps::new("PIN Code").size(14.0).color(TypographyColor::Muted));
+            ui.add_space(4.0);
+            Input::new("pin_input")
+                .placeholder("000000")
+                .width(ui.available_width())
+                .show(ui, theme, &mut self.pin_string);
+
+            ui.add_space(20.0);
+
+            let can_connect = !self.ip_string.is_empty() && !self.pin_string.is_empty();
+            if Button::new("🔗 Connect")
+                .enabled(can_connect)
+                .show(ui, theme)
                 .clicked()
             {
-                self.mode = AppMode::Home;
+                *self.connection_status.lock().unwrap() = "Connecting...".to_string();
+                let ip = self.ip_string.clone();
+                let pin = self.pin_string.clone();
+                let status_clone = self.connection_status.clone();
+                let ctx_clone = ui.ctx().clone();
+                self._discovery_rx = None;
+
+                self.client_task = Some(std::thread::spawn(move || {
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(async {
+                        match network::start_client(&ip, 4444, &pin).await {
+                            Ok(conn) => {
+                                *status_clone.lock().unwrap() =
+                                    "Connected Successfully!".to_string();
+                                ctx_clone.request_repaint();
+
+                                let (tx, rx) =
+                                    mpsc::channel::<network::NetworkEvent>(100);
+
+                                let rt2 = tokio::runtime::Runtime::new().unwrap();
+                                rt2.spawn(capture::os::start_simulation(rx));
+
+                                network::run_receive_loop(conn, tx).await;
+
+                                *status_clone.lock().unwrap() =
+                                    "Disconnected".to_string();
+                                ctx_clone.request_repaint();
+                            }
+                            Err(e) => {
+                                *status_clone.lock().unwrap() =
+                                    format!("Connection Error: {}", e);
+                                ctx_clone.request_repaint();
+                            }
+                        }
+                    });
+                }));
             }
+        });
+
+        ui.add_space(8.0);
+        text(ui, theme, TextProps::new("Enter the IP address and PIN code shown on the sharing computer to connect.").size(12.0).color(TypographyColor::Muted));
+
+        ui.add_space(12.0);
+        let badge_props = if status.contains("Success") {
+            BadgeProps::new(&status).variant(BadgeVariant::Default).color(ACCENT_GREEN)
+        } else if status.contains("Error") {
+            BadgeProps::new(&status).variant(BadgeVariant::Destructive)
         } else {
-            ui.label(
-                egui::RichText::new("Some checks failed. Please fix the issues above.")
-                    .size(14.0)
-                    .color(egui::Color32::from_rgb(240, 180, 60)),
-            );
-            ui.add_space(10.0);
-            if ui
-                .add_sized(egui::vec2(160.0, 40.0), egui::Button::new("Continue anyway"))
-                .clicked()
-            {
-                self.mode = AppMode::Home;
-            }
-        }
+            BadgeProps::new(&status).variant(BadgeVariant::Secondary)
+        };
+        badge(ui, theme, badge_props);
     }
 }
 
-fn main() -> Result<(), eframe::Error> {
+fn main() -> eframe::Result {
+    // Prefer Wayland on Linux when available
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var("WAYLAND_DISPLAY").is_ok() {
+            std::env::set_var("WINIT_UNIX_BACKEND", "wayland");
+        }
+    }
+
     tracing_subscriber::fmt::init();
+
+    // Load icon from PNG
+    let icon_bytes = include_bytes!("../FreeMouse.png");
+    let icon_data = image::load_from_memory(icon_bytes).ok().map(|img| {
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        IconData {
+            rgba: rgba.into_raw(),
+            width: w,
+            height: h,
+        }
+    });
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([520.0, 600.0])
-            .with_min_inner_size([400.0, 400.0]),
+            .with_inner_size([640.0, 720.0])
+            .with_min_inner_size([560.0, 680.0])
+            .with_icon(icon_data.map(Arc::new).unwrap_or_default()),
         ..Default::default()
     };
 
@@ -751,17 +858,7 @@ fn main() -> Result<(), eframe::Error> {
         "Freemouse",
         options,
         Box::new(|cc| {
-            let mut style = (*cc.egui_ctx.style()).clone();
-            style.visuals = egui::Visuals::dark();
-            style.visuals.window_rounding = egui::Rounding::same(10.0);
-            style.visuals.widgets.noninteractive.rounding = egui::Rounding::same(8.0);
-            style.visuals.widgets.inactive.rounding = egui::Rounding::same(8.0);
-            style.visuals.widgets.hovered.rounding = egui::Rounding::same(8.0);
-            style.visuals.widgets.active.rounding = egui::Rounding::same(8.0);
-            cc.egui_ctx.set_style(style);
-
             let mut app = FreemouseApp::default();
-            // Load logo texture
             let logo_bytes = include_bytes!("../FreeMouse.png");
             if let Ok(img) = image::load_from_memory(logo_bytes) {
                 let rgba = img.to_rgba8();
@@ -776,7 +873,7 @@ fn main() -> Result<(), eframe::Error> {
                     egui::TextureOptions::default(),
                 ));
             }
-            Box::new(app)
+            Ok(Box::new(app))
         }),
     )
 }

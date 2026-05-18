@@ -1055,35 +1055,77 @@ pub mod os {
         })
     }
 
-    /// Query the actual cursor position from the display server (xdotool).
-    /// Returns `(x, y)` or `None` if unavailable.
-    fn query_cursor_pos() -> Option<(f64, f64)> {
-        let output = std::process::Command::new("xdotool")
-            .args(["getmouselocation", "--shell"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut x = None;
-        let mut y = None;
-        for line in stdout.lines() {
-            if let Some(val) = line.strip_prefix("X=") {
-                x = val.trim().parse::<f64>().ok();
-            } else if let Some(val) = line.strip_prefix("Y=") {
-                y = val.trim().parse::<f64>().ok();
+    /// Detect edge hits using evdev RELATIVE event patterns.
+    /// Works on both X11 and Wayland without querying the display server.
+    ///
+    /// When the cursor hits the screen edge, the display server clamps it,
+    /// but the physical mouse can keep moving. This produces a sustained
+    /// stream of same-direction REL events. We detect this "pushing against
+    /// the wall" pattern by counting consecutive same-sign values.
+    ///
+    /// For ABSOLUTE devices (touchpads), we use direct position comparison.
+    struct EdgeDetector {
+        /// Consecutive positive (rightward) REL_X events
+        right_streak: u32,
+        /// Consecutive negative (leftward) REL_X events
+        left_streak: u32,
+        /// Events of same sign needed to trigger
+        threshold: u32,
+        /// Whether we're currently in "pushing" state (prevents re-trigger)
+        was_right_edge: bool,
+        was_left_edge: bool,
+    }
+
+    impl EdgeDetector {
+        fn new(threshold: u32) -> Self {
+            Self {
+                right_streak: 0,
+                left_streak: 0,
+                threshold,
+                was_right_edge: false,
+                was_left_edge: false,
             }
         }
-        Some((x?, y?))
+
+        /// Feed a REL_X value. Returns `Some(true)` if right edge hit,
+        /// `Some(false)` if left edge hit, `None` otherwise.
+        fn feed_rel_x(&mut self, value: i32) -> Option<bool> {
+            if value > 0 {
+                self.right_streak += 1;
+                self.left_streak = 0;
+                if self.right_streak >= self.threshold && !self.was_right_edge {
+                    self.was_right_edge = true;
+                    self.was_left_edge = false;
+                    return Some(true);
+                }
+            } else if value < 0 {
+                self.left_streak += 1;
+                self.right_streak = 0;
+                if self.left_streak >= self.threshold && !self.was_left_edge {
+                    self.was_left_edge = true;
+                    self.was_right_edge = false;
+                    return Some(false);
+                }
+            } else {
+                // Zero value — no movement, don't reset streaks (mouse paused at edge)
+            }
+            None
+        }
+
+        fn reset(&mut self) {
+            self.right_streak = 0;
+            self.left_streak = 0;
+            self.was_right_edge = false;
+            self.was_left_edge = false;
+        }
     }
 
     /// Start evdev-based input capture on Linux.
     /// No exclusive grab — the local cursor always works.
     /// Mouse Without Borders style: move mouse to right edge to transition
     /// to the remote machine; move to left edge to come back.
-    /// Cursor position is periodically resynced from the display server so
-    /// edge detection matches the actual on-screen cursor.
+    /// Edge detection uses velocity-pattern analysis on REL events
+    /// (works on X11 and Wayland alike).
     pub fn start_capture(tx: mpsc::Sender<NetworkEvent>, screen_width: f64) {
         IS_REMOTE.store(false, Ordering::SeqCst);
         STOP_FLAG.store(false, Ordering::SeqCst);
@@ -1118,24 +1160,12 @@ pub mod os {
                 return;
             }
 
-            let mut mouse_x: f64 = screen_width / 2.0;
-            let mut mouse_y: f64 = 540.0;
-            let mut resync_counter: u32 = 0;
+            let mut edge_detector = EdgeDetector::new(12);
             let edge_threshold = 5.0;
 
             loop {
                 if stop_flag.load(Ordering::SeqCst) {
                     break;
-                }
-
-                // Periodically resync cursor position from the display server
-                resync_counter += 1;
-                if resync_counter >= 50 {
-                    resync_counter = 0;
-                    if let Some((rx, ry)) = query_cursor_pos() {
-                        mouse_x = rx;
-                        mouse_y = ry;
-                    }
                 }
 
                 for device in &mut opened_devices {
@@ -1147,8 +1177,7 @@ pub mod os {
                                     &tx,
                                     &is_remote,
                                     screen_width,
-                                    &mut mouse_x,
-                                    &mut mouse_y,
+                                    &mut edge_detector,
                                     edge_threshold,
                                 );
                             }
@@ -1172,8 +1201,7 @@ pub mod os {
         tx: &mpsc::Sender<NetworkEvent>,
         is_remote: &AtomicBool,
         screen_width: f64,
-        mouse_x: &mut f64,
-        mouse_y: &mut f64,
+        edge: &mut EdgeDetector,
         edge_threshold: f64,
     ) {
         let currently_remote = is_remote.load(Ordering::SeqCst);
@@ -1183,29 +1211,67 @@ pub mod os {
                 let value = event.value();
                 match event.code() {
                     0 => {
-                        *mouse_x = (*mouse_x + value as f64).clamp(0.0, 10000.0);
-                        handle_mouse_move(*mouse_x, *mouse_y, tx, is_remote, screen_width, edge_threshold);
+                        // REL_X — feed into velocity-based edge detector
+                        if let Some(is_right) = edge.feed_rel_x(value) {
+                            if is_right && !currently_remote {
+                                is_remote.store(true, Ordering::SeqCst);
+                                tracing::info!(
+                                    "Remote mode ON (sustained rightward movement)"
+                                );
+                            } else if !is_right && currently_remote {
+                                is_remote.store(false, Ordering::SeqCst);
+                                tracing::info!(
+                                    "Remote mode OFF (sustained leftward movement)"
+                                );
+                            }
+                        }
+                        // Forward absolute position estimate when remote
+                        if currently_remote {
+                            // Build an approximate x from cumulative delta
+                            let _ = tx.blocking_send(NetworkEvent::MouseMoveRelative(
+                                value as f64, 0.0,
+                            ));
+                        }
                     }
                     1 => {
-                        *mouse_y = (*mouse_y + value as f64).clamp(0.0, 10000.0);
-                        handle_mouse_move(*mouse_x, *mouse_y, tx, is_remote, screen_width, edge_threshold);
+                        // REL_Y
+                        if currently_remote {
+                            let _ = tx.blocking_send(NetworkEvent::MouseMoveRelative(
+                                0.0, value as f64,
+                            ));
+                        }
                     }
                     8 if currently_remote => {
+                        // REL_WHEEL
                         let _ = tx.blocking_send(NetworkEvent::MouseScroll(0, value));
                     }
                     _ => {}
                 }
             }
             EventType::ABSOLUTE => {
-                let value = event.value() as f64;
+                // Absolute devices (touchpads) give us the real position
+                // Use direct edge comparison
+                let val = event.value() as f64;
                 match event.code() {
                     0 => {
-                        *mouse_x = value;
-                        handle_mouse_move(*mouse_x, *mouse_y, tx, is_remote, screen_width, edge_threshold);
+                        // ABS_X
+                        if !currently_remote && val >= screen_width - edge_threshold {
+                            is_remote.store(true, Ordering::SeqCst);
+                            edge.reset();
+                            tracing::info!("Remote mode ON (ABS X at {:.0})", val);
+                        } else if currently_remote && val <= edge_threshold {
+                            is_remote.store(false, Ordering::SeqCst);
+                            edge.reset();
+                            tracing::info!("Remote mode OFF (ABS X at {:.0})", val);
+                        } else if currently_remote {
+                            let _ = tx.blocking_send(NetworkEvent::MouseMoved(val, 0.0));
+                        }
                     }
                     1 => {
-                        *mouse_y = value;
-                        handle_mouse_move(*mouse_x, *mouse_y, tx, is_remote, screen_width, edge_threshold);
+                        // ABS_Y — send with last known x
+                        if currently_remote {
+                            let _ = tx.blocking_send(NetworkEvent::MouseMoved(val, 0.0));
+                        }
                     }
                     _ => {}
                 }
@@ -1226,27 +1292,6 @@ pub mod os {
             }
             EventType::SYNCHRONIZATION => {}
             _ => {}
-        }
-    }
-
-    fn handle_mouse_move(
-        x: f64,
-        y: f64,
-        tx: &mpsc::Sender<NetworkEvent>,
-        is_remote: &AtomicBool,
-        screen_width: f64,
-        edge_threshold: f64,
-    ) {
-        let currently_remote = is_remote.load(Ordering::SeqCst);
-
-        if !currently_remote && x >= screen_width - edge_threshold {
-            is_remote.store(true, Ordering::SeqCst);
-            tracing::info!("Remote mode ON (mouse crossed right edge at x={:.0})", x);
-        } else if currently_remote && x <= edge_threshold {
-            is_remote.store(false, Ordering::SeqCst);
-            tracing::info!("Remote mode OFF (mouse crossed left edge at x={:.0})", x);
-        } else if currently_remote {
-            let _ = tx.blocking_send(NetworkEvent::MouseMoved(x, y));
         }
     }
 
@@ -1324,6 +1369,93 @@ pub mod os {
             MouseButton::Middle => 0x112, // BTN_MIDDLE
             MouseButton::X1 => 0x113,     // BTN_SIDE
             MouseButton::X2 => 0x114,     // BTN_EXTRA
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::EdgeDetector;
+
+        #[test]
+        fn edge_detector_noise_does_not_trigger() {
+            let mut d = EdgeDetector::new(10);
+            // Random noise — alternating directions, should not trigger
+            for _ in 0..100 {
+                assert!(d.feed_rel_x(1).is_none());
+                assert!(d.feed_rel_x(-1).is_none());
+            }
+        }
+
+        #[test]
+        fn edge_detector_right_streak_triggers() {
+            let mut d = EdgeDetector::new(5);
+            // 4 same-sign events: not enough
+            for i in 0..4 {
+                assert!(d.feed_rel_x(1).is_none(), "failed at i={}", i);
+            }
+            // 5th event triggers
+            assert_eq!(d.feed_rel_x(1), Some(true));
+        }
+
+        #[test]
+        fn edge_detector_left_streak_triggers() {
+            let mut d = EdgeDetector::new(5);
+            for i in 0..4 {
+                assert!(d.feed_rel_x(-1).is_none(), "failed at i={}", i);
+            }
+            assert_eq!(d.feed_rel_x(-1), Some(false));
+        }
+
+        #[test]
+        fn edge_detector_direction_change_resets() {
+            let mut d = EdgeDetector::new(10);
+            // Build up right streak
+            for _ in 0..9 {
+                assert!(d.feed_rel_x(1).is_none());
+            }
+            // Change direction — resets streak
+            assert!(d.feed_rel_x(-1).is_none());
+            // Need 10 more right events from scratch
+            for _ in 0..9 {
+                assert!(d.feed_rel_x(1).is_none());
+            }
+            assert_eq!(d.feed_rel_x(1), Some(true));
+        }
+
+        #[test]
+        fn edge_detector_no_double_trigger() {
+            let mut d = EdgeDetector::new(3);
+            assert_eq!(d.feed_rel_x(1), None);
+            assert_eq!(d.feed_rel_x(1), None);
+            assert_eq!(d.feed_rel_x(1), Some(true));
+            // More same-direction events should not re-trigger
+            for _ in 0..20 {
+                assert!(d.feed_rel_x(1).is_none());
+            }
+        }
+
+        #[test]
+        fn edge_detector_reset_works() {
+            let mut d = EdgeDetector::new(3);
+            assert_eq!(d.feed_rel_x(1), None);
+            assert_eq!(d.feed_rel_x(1), None);
+            assert_eq!(d.feed_rel_x(1), Some(true));
+            d.reset();
+            // After reset, should trigger again
+            assert_eq!(d.feed_rel_x(1), None);
+            assert_eq!(d.feed_rel_x(1), None);
+            assert_eq!(d.feed_rel_x(1), Some(true));
+        }
+
+        #[test]
+        fn edge_detector_zero_does_not_reset_streak() {
+            let mut d = EdgeDetector::new(4);
+            assert!(d.feed_rel_x(1).is_none());
+            assert!(d.feed_rel_x(1).is_none());
+            // Zero (no movement) should not break the streak
+            assert!(d.feed_rel_x(0).is_none());
+            assert!(d.feed_rel_x(1).is_none());
+            assert_eq!(d.feed_rel_x(1), Some(true));
         }
     }
 }

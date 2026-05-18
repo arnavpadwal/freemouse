@@ -4,12 +4,17 @@ version = "0.1.0"
 edition = "2021"
 build = "build.rs"
 
+[lib]
+name = "freemouse"
+path = "src/lib.rs"
+
 [[bin]]
 name = "FreeMouse"
 path = "src/main.rs"
 
 [dependencies]
-eframe = "0.27"
+eframe = "0.33"
+egui-shadcn = "0.5"
 tokio = { version = "1.37", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 bincode = "1.3"
