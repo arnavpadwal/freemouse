@@ -5,7 +5,7 @@ use chacha20poly1305::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
