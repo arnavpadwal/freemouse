@@ -1,85 +1,104 @@
-use crate::network::{KeyCode, MouseButton, NetworkEvent};
+use crate::network::{Edge, KeyCode, MouseButton, NetworkEvent, ScreenInfo};
+use crate::router::EdgeRouter;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
-// ============================================================
-// Screen size detection (cross-platform)
-// ============================================================
+lazy_static::lazy_static! {
+    static ref EDGE_ROUTER: Mutex<Option<EdgeRouter>> = Mutex::new(None);
+    static ref ACTIVE_PEER: Mutex<Option<Uuid>> = Mutex::new(None);
+    static ref PRESSED_KEYS: Mutex<Vec<KeyCode>> = Mutex::new(Vec::new());
+}
+
+pub fn set_edge_router(router: EdgeRouter) {
+    *EDGE_ROUTER.lock().unwrap() = Some(router);
+}
+
+pub fn set_active_peer(peer: Option<Uuid>) {
+    *ACTIVE_PEER.lock().unwrap() = peer;
+}
+
+pub fn get_active_peer() -> Option<Uuid> {
+    *ACTIVE_PEER.lock().unwrap()
+}
+
+/// Enumerate all displays using display-info crate.
+pub fn get_screens() -> Vec<ScreenInfo> {
+    match display_info::DisplayInfo::all() {
+        Ok(displays) if !displays.is_empty() => displays
+            .into_iter()
+            .map(|d| ScreenInfo {
+                x: d.x as f64,
+                y: d.y as f64,
+                width: d.width as f64,
+                height: d.height as f64,
+                primary: d.is_primary,
+            })
+            .collect(),
+        _ => vec![ScreenInfo {
+            x: 0.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+            primary: true,
+        }],
+    }
+}
 
 /// Returns the main display dimensions (width, height) in pixels.
-/// Falls back to 1920x1080 on failure.
 pub fn get_screen_size() -> (f64, f64) {
+    get_screens()
+        .into_iter()
+        .find(|s| s.primary)
+        .or_else(|| get_screens().into_iter().next())
+        .map(|s| (s.width, s.height))
+        .unwrap_or((1920.0, 1080.0))
+}
+
+/// Warp cursor to absolute screen position.
+pub fn warp_cursor(x: f64, y: f64) {
     #[cfg(any(windows, target_os = "macos"))]
     {
-        // Use rdev for screen size on Windows/macOS
-        match rdev::display_size() {
-            Ok((w, h)) => return (w as f64, h as f64),
-            Err(_) => {}
+        use enigo::{Coordinate, Enigo, Mouse, Settings};
+        if let Ok(mut enigo) = Enigo::new(&Settings::default()) {
+            let _ = enigo.move_mouse(x as i32, y as i32, Coordinate::Abs);
         }
     }
-
     #[cfg(target_os = "linux")]
     {
-        // Try using env vars or xrandr on Linux
-        if let Ok(output) = std::process::Command::new("xrandr")
-            .args(["--current", "--query"])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if line.contains(" connected") {
-                    // Parse "2560x1440+0+0" or similar
-                    if let Some(dim_str) = line
-                        .split(' ')
-                        .find(|s| s.contains('x') && s.contains('+'))
-                        .or_else(|| {
-                            // Alternative: "1920x1080"
-                            line.split(' ')
-                                .find(|s| s.contains('x') && !s.contains('+'))
-                        })
-                    {
-                        // Extract just the resolution part before any '+'
-                        let res = dim_str.split('+').next().unwrap_or(dim_str);
-                        if let Some((w_str, h_str)) = res.split_once('x') {
-                            if let (Ok(w), Ok(h)) = (w_str.parse::<f64>(), h_str.parse::<f64>()) {
-                                return (w, h);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Fallback: check WAYLAND_DISPLAY and DISPLAY env vars
-        if std::env::var("WAYLAND_DISPLAY").is_ok() {
-            // Try `wlr-randr` or `wl-info`
-            if let Ok(output) = std::process::Command::new("wlr-randr")
-                .arg("--json")
-                .output()
-            {
-                // Simple JSON parse for resolution
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(mode) = stdout.split("\"mode\"").nth(1) {
-                    if let Some(w) = mode.split("\"width\":").nth(1) {
-                        if let Some(w_val) = w.split(',').next() {
-                            if let Some(h) = mode.split("\"height\":").nth(1) {
-                                if let Some(h_val) = h.split(',').next() {
-                                    if let (Ok(w), Ok(h)) =
-                                        (w_val.trim().parse::<f64>(), h_val.trim().parse::<f64>())
-                                    {
-                                        return (w, h);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        if std::env::var("DISPLAY").is_ok() {
+            let _ = std::process::Command::new("xdotool")
+                .args(["mousemove", "--", &format!("{}", x as i32), &format!("{}", y as i32)])
+                .output();
         }
     }
+}
 
-    (1920.0, 1080.0)
+fn handle_remote_enter(from_edge: Edge, y_ratio: f64) {
+    let (sw, sh) = get_screen_size();
+    let entry_edge = crate::layout::WorkspaceLayout::opposite_edge(from_edge);
+    let (x, y) = EdgeRouter::entry_position(entry_edge, y_ratio, sw, sh);
+    warp_cursor(x, y);
+    #[cfg(any(windows, target_os = "macos"))]
+    os::set_remote(false);
+    #[cfg(target_os = "linux")]
+    os::set_remote(false);
+}
+
+fn track_key(kc: &KeyCode, pressed: bool) {
+    let mut keys = PRESSED_KEYS.lock().unwrap();
+    if pressed {
+        if !keys.contains(kc) {
+            keys.push(kc.clone());
+        }
+    } else {
+        keys.retain(|k| k != kc);
+    }
+}
+
+fn snapshot_pressed_keys() -> Vec<KeyCode> {
+    PRESSED_KEYS.lock().unwrap().clone()
 }
 
 // ============================================================
@@ -119,6 +138,10 @@ pub mod os {
         IS_REMOTE.load(Ordering::SeqCst)
     }
 
+    pub fn set_remote(value: bool) {
+        IS_REMOTE.store(value, Ordering::SeqCst);
+    }
+
     /// Start global input capture. Spawns a thread that uses rdev::grab
     /// to intercept input events when in "remote" mode.
     pub fn start_capture(tx: mpsc::Sender<NetworkEvent>, screen_width: f64) {
@@ -141,15 +164,36 @@ pub mod os {
 
                 match event.event_type {
                     EventType::MouseMove { x, y } => {
-                        if !currently_remote && x >= screen_width - 2.0 {
-                            is_remote.store(true, Ordering::SeqCst);
-                            event_handled = true;
+                        let (_, sh) = super::get_screen_size();
+                        if !currently_remote {
+                            if let Some(router) = super::EDGE_ROUTER.lock().unwrap().as_ref() {
+                                if let Some((neighbor_id, edge, y_ratio)) =
+                                    router.check_edge_cross(x, y, screen_width, sh, 2.0)
+                                {
+                                    is_remote.store(true, Ordering::SeqCst);
+                                    super::set_active_peer(Some(neighbor_id));
+                                    let _ = tx.blocking_send(NetworkEvent::RemoteEnter {
+                                        from_edge: edge,
+                                        y_ratio,
+                                    });
+                                    let _ = tx.blocking_send(NetworkEvent::KeyStateSnapshot(
+                                        super::snapshot_pressed_keys(),
+                                    ));
+                                    event_handled = true;
+                                }
+                            } else if x >= screen_width - 2.0 {
+                                is_remote.store(true, Ordering::SeqCst);
+                                event_handled = true;
+                            }
                         } else if currently_remote && x <= 2.0 {
                             is_remote.store(false, Ordering::SeqCst);
+                            super::set_active_peer(None);
+                            let _ = tx.blocking_send(NetworkEvent::RemoteLeave {
+                                to_edge: Edge::Left,
+                            });
                             event_handled = true;
                         } else if currently_remote {
                             if tx.blocking_send(NetworkEvent::MouseMoved(x, y)).is_err() {
-                                // Channel closed, stop capture
                                 stop_flag.store(true, Ordering::SeqCst);
                                 return Some(event);
                             }
@@ -157,6 +201,9 @@ pub mod os {
                         }
                     }
                     EventType::KeyPress(key) => {
+                        if let Some(kc) = rdev_key_to_keycode(key) {
+                            super::track_key(&kc, true);
+                        }
                         if currently_remote {
                             if let Some(kc) = rdev_key_to_keycode(key) {
                                 if tx.blocking_send(NetworkEvent::KeyDown(kc)).is_err() {
@@ -168,6 +215,9 @@ pub mod os {
                         }
                     }
                     EventType::KeyRelease(key) => {
+                        if let Some(kc) = rdev_key_to_keycode(key) {
+                            super::track_key(&kc, false);
+                        }
                         if currently_remote {
                             if let Some(kc) = rdev_key_to_keycode(key) {
                                 if tx.blocking_send(NetworkEvent::KeyUp(kc)).is_err() {
@@ -222,25 +272,25 @@ pub mod os {
             };
 
             if let Err(e) = grab(callback) {
-                eprintln!("Error grabbing input: {:?}", e);
+                tracing::debug!("Error grabbing input: {:?}", e);
             }
         });
     }
 
     /// Start receiving and simulating input events on the receiver side.
     pub async fn start_simulation(mut rx: mpsc::Receiver<NetworkEvent>) {
-        eprintln!("[simulation] start_simulation called (enigo)");
+        tracing::debug!("[simulation] start_simulation called (enigo)");
         let mut enigo = match Enigo::new(&Settings::default()) {
             Ok(e) => e,
             Err(e) => {
-                eprintln!("[simulation] Failed to create Enigo instance: {:?}", e);
+                tracing::debug!("[simulation] Failed to create Enigo instance: {:?}", e);
                 return;
             }
         };
-        eprintln!("[simulation] enigo initialized, waiting for events...");
+        tracing::debug!("[simulation] enigo initialized, waiting for events...");
 
         while let Some(event) = rx.recv().await {
-            eprintln!("[simulation] received: {:?}", event);
+            tracing::debug!("[simulation] received: {:?}", event);
             match event {
                 NetworkEvent::MouseMoved(x, y) => {
                     let _ = enigo.move_mouse(x as i32, y as i32, Coordinate::Abs);
@@ -256,8 +306,13 @@ pub mod os {
                     let eb = mousebutton_to_enigo_button(&btn);
                     let _ = enigo.button(eb, Direction::Release);
                 }
-                NetworkEvent::MouseScroll(_dx, dy) => {
-                    let _ = enigo.scroll(dy, Axis::Vertical);
+                NetworkEvent::MouseScroll(dx, dy) => {
+                    if dx != 0 {
+                        let _ = enigo.scroll(dx, Axis::Horizontal);
+                    }
+                    if dy != 0 {
+                        let _ = enigo.scroll(dy, Axis::Vertical);
+                    }
                 }
                 NetworkEvent::KeyDown(kc) => {
                     if let Some(ek) = keycode_to_enigo_key(&kc) {
@@ -269,7 +324,23 @@ pub mod os {
                         let _ = enigo.key(ek, Direction::Release);
                     }
                 }
-                _ => {} // Clipboard/keepalive handled by network loop
+                NetworkEvent::CursorWarp(x, y) => {
+                    super::warp_cursor(x, y);
+                }
+                NetworkEvent::RemoteEnter { from_edge, y_ratio } => {
+                    super::handle_remote_enter(from_edge, y_ratio);
+                }
+                NetworkEvent::RemoteLeave { .. } => {
+                    set_remote(true);
+                }
+                NetworkEvent::KeyStateSnapshot(keys) => {
+                    for kc in keys {
+                        if let Some(ek) = keycode_to_enigo_key(&kc) {
+                            let _ = enigo.key(ek, Direction::Press);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -582,8 +653,10 @@ pub mod os {
 #[cfg(target_os = "linux")]
 pub mod os {
     use super::*;
-    use evdev::{Device, EventType, InputEvent, Key as EvdevKey, RelativeAxisType};
-    use evdev::uinput::VirtualDeviceBuilder;
+    use evdev::{
+        uinput::VirtualDeviceBuilder, AbsInfo, AbsoluteAxisType, Device, EventType, InputEvent,
+        Key as EvdevKey, RelativeAxisType, UinputAbsSetup,
+    };
 
     lazy_static::lazy_static! {
         static ref IS_REMOTE: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
@@ -597,12 +670,16 @@ pub mod os {
     pub fn toggle_remote() -> bool {
         let new = !IS_REMOTE.load(Ordering::SeqCst);
         IS_REMOTE.store(new, Ordering::SeqCst);
-        eprintln!("[capture] Remote toggled to {}", if new { "ON" } else { "OFF" });
+        tracing::debug!("[capture] Remote toggled to {}", if new { "ON" } else { "OFF" });
         new
     }
 
     pub fn is_remote() -> bool {
         IS_REMOTE.load(Ordering::SeqCst)
+    }
+
+    pub fn set_remote(value: bool) {
+        IS_REMOTE.store(value, Ordering::SeqCst);
     }
 
     /// Create a uinput virtual device that supports BOTH keyboard and mouse.
@@ -662,12 +739,37 @@ pub mod os {
         rel.insert(RelativeAxisType::REL_WHEEL);
         rel.insert(RelativeAxisType::REL_HWHEEL);
 
+        let (sw, sh) = super::get_screen_size();
+        let w = sw.max(1.0) as i32;
+        let h = sh.max(1.0) as i32;
+        let abs_x = UinputAbsSetup::new(
+            AbsoluteAxisType::ABS_X,
+            AbsInfo::new(0, 0, w, 0, 0, 1),
+        );
+        let abs_y = UinputAbsSetup::new(
+            AbsoluteAxisType::ABS_Y,
+            AbsInfo::new(0, 0, h, 0, 0, 1),
+        );
+
         VirtualDeviceBuilder::new()
             .ok()
             .map(|b| b.name("Freemouse Virtual Input"))
             .and_then(|b| b.with_keys(&keys).ok())
             .and_then(|b| b.with_relative_axes(&rel).ok())
+            .and_then(|b| b.with_absolute_axis(&abs_x).ok())
+            .and_then(|b| b.with_absolute_axis(&abs_y).ok())
             .and_then(|b| b.build().ok())
+    }
+
+    fn evdev_btn_to_mousebutton(key: EvdevKey) -> Option<MouseButton> {
+        Some(match key {
+            EvdevKey::BTN_LEFT => MouseButton::Left,
+            EvdevKey::BTN_RIGHT => MouseButton::Right,
+            EvdevKey::BTN_MIDDLE => MouseButton::Middle,
+            EvdevKey::BTN_SIDE => MouseButton::X1,
+            EvdevKey::BTN_EXTRA => MouseButton::X2,
+            _ => return None,
+        })
     }
 
     /// Find and open evdev keyboard/mouse devices.
@@ -676,12 +778,12 @@ pub mod os {
         let mut devices = Vec::new();
         let input_dir = std::path::Path::new("/dev/input");
         if !input_dir.exists() {
-            eprintln!("[capture] /dev/input does not exist");
+            tracing::debug!("[capture] /dev/input does not exist");
             return devices;
         }
 
         let Ok(entries) = std::fs::read_dir(input_dir) else {
-            eprintln!("[capture] Cannot read /dev/input");
+            tracing::debug!("[capture] Cannot read /dev/input");
             return devices;
         };
 
@@ -703,13 +805,13 @@ pub mod os {
 
                     if has_keys || has_mouse || has_buttons {
                         let dev_name = device.name().unwrap_or("unknown");
-                        eprintln!("[capture] found: {} (keys={} mouse={} buttons={})",
+                        tracing::debug!("[capture] found: {} (keys={} mouse={} buttons={})",
                             dev_name, has_keys, has_mouse, has_buttons);
                         devices.push((device, has_keys));
                     }
                 }
                 Err(e) => {
-                    eprintln!("[capture] cannot open {:?}: {}", path, e);
+                    tracing::debug!("[capture] cannot open {:?}: {}", path, e);
                 }
             }
         }
@@ -768,7 +870,7 @@ pub mod os {
     /// Start evdev-based input capture on Linux.
     /// Uses exclusive grab + uinput replay (like Barrier/Synergy).
     pub fn start_capture(tx: mpsc::Sender<NetworkEvent>, screen_width: f64) {
-        eprintln!("[capture] start_capture called, screen_width={}", screen_width);
+        tracing::debug!("[capture] start_capture called, screen_width={}", screen_width);
         IS_REMOTE.store(false, Ordering::SeqCst);
         STOP_FLAG.store(false, Ordering::SeqCst);
 
@@ -780,16 +882,16 @@ pub mod os {
             let mut uinput = match create_uinput_device() {
                 Some(d) => d,
                 None => {
-                    eprintln!("[capture] FAILED to create uinput device — check /dev/uinput permissions!");
+                    tracing::debug!("[capture] FAILED to create uinput device — check /dev/uinput permissions!");
                     return;
                 }
             };
-            eprintln!("[capture] uinput device created");
+            tracing::debug!("[capture] uinput device created");
 
             // Find and grab input devices
             let raw_devices = find_input_devices();
             if raw_devices.is_empty() {
-                eprintln!("[capture] NO input devices found");
+                tracing::debug!("[capture] NO input devices found");
                 return;
             }
 
@@ -797,27 +899,28 @@ pub mod os {
             for (mut dev, is_kbd) in raw_devices {
                 match dev.grab() {
                     Ok(()) => {
-                        eprintln!("[capture] grabbed: {} (keyboard={})",
+                        tracing::debug!("[capture] grabbed: {} (keyboard={})",
                             dev.name().unwrap_or("unknown"), is_kbd);
                         grabbed.push((dev, is_kbd));
                     }
                     Err(e) => {
-                        eprintln!("[capture] grab failed for {}: {} (try sudo or add to input group)",
+                        tracing::debug!("[capture] grab failed for {}: {} (try sudo or add to input group)",
                             dev.name().unwrap_or("unknown"), e);
                     }
                 }
             }
 
             if grabbed.is_empty() {
-                eprintln!("[capture] could not grab any devices — exiting");
+                tracing::debug!("[capture] could not grab any devices — exiting");
                 return;
             }
 
             let mut edge_detector = EdgeDetector::new(3);
             let edge_threshold = 5.0;
             let mut last_abs_x = 0.0_f64;
+            let mut last_abs_y = 0.0_f64;
 
-            eprintln!("[capture] entering event loop, {} grabbed devices", grabbed.len());
+            tracing::debug!("[capture] entering event loop, {} grabbed devices", grabbed.len());
 
             loop {
                 if stop_flag.load(Ordering::SeqCst) {
@@ -825,7 +928,7 @@ pub mod os {
                     for (dev, _) in &mut grabbed {
                         let _ = dev.ungrab();
                     }
-                    eprintln!("[capture] stopped, devices ungrabbed");
+                    tracing::debug!("[capture] stopped, devices ungrabbed");
                     break;
                 }
 
@@ -833,11 +936,12 @@ pub mod os {
                     match device.fetch_events() {
                         Ok(events) => {
                             for event in events {
-                                // ALWAYS replay via uinput so local system gets input
-                                let _ = uinput.emit(&[event]);
-
-                                // Also process for remote forwarding
                                 let currently_remote = is_remote.load(Ordering::SeqCst);
+                                // Replay locally only when not forwarding to remote
+                                if !currently_remote {
+                                    let _ = uinput.emit(&[event]);
+                                }
+
                                 handle_evdev_event(
                                     &event,
                                     &tx,
@@ -846,13 +950,14 @@ pub mod os {
                                     &mut edge_detector,
                                     edge_threshold,
                                     &mut last_abs_x,
+                                    &mut last_abs_y,
                                     currently_remote,
                                 );
                             }
                         }
                         Err(e) => {
                             if e.kind() != std::io::ErrorKind::WouldBlock {
-                                eprintln!("[capture] evdev fetch error: {}", e);
+                                tracing::debug!("[capture] evdev fetch error: {}", e);
                             }
                         }
                     }
@@ -863,6 +968,7 @@ pub mod os {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_evdev_event(
         event: &InputEvent,
         tx: &mpsc::Sender<NetworkEvent>,
@@ -871,6 +977,7 @@ pub mod os {
         edge: &mut EdgeDetector,
         edge_threshold: f64,
         last_abs_x: &mut f64,
+        last_abs_y: &mut f64,
         currently_remote: bool,
     ) {
         match event.event_type() {
@@ -878,39 +985,70 @@ pub mod os {
                 let value = event.value();
                 match event.code() {
                     0 => {
-                        if let Some(is_right) = edge.feed_rel_x(value) {
+                        if let Some(router) = super::EDGE_ROUTER.lock().unwrap().as_ref() {
+                            let (_, sh) = super::get_screen_size();
+                            if !currently_remote && value > 0 {
+                                if let Some((neighbor_id, edge, y_ratio)) =
+                                    router.check_edge_cross(
+                                        screen_width - 1.0,
+                                        sh / 2.0,
+                                        screen_width,
+                                        sh,
+                                        2.0,
+                                    )
+                                {
+                                    is_remote.store(true, Ordering::SeqCst);
+                                    super::set_active_peer(Some(neighbor_id));
+                                    let _ = tx.blocking_send(NetworkEvent::RemoteEnter {
+                                        from_edge: edge,
+                                        y_ratio,
+                                    });
+                                    let _ = tx.blocking_send(NetworkEvent::KeyStateSnapshot(
+                                        super::snapshot_pressed_keys(),
+                                    ));
+                                }
+                            } else if currently_remote && value < 0 {
+                                is_remote.store(false, Ordering::SeqCst);
+                                super::set_active_peer(None);
+                                let _ = tx.blocking_send(NetworkEvent::RemoteLeave {
+                                    to_edge: Edge::Left,
+                                });
+                            }
+                        } else if let Some(is_right) = edge.feed_rel_x(value) {
                             if is_right && !currently_remote {
                                 is_remote.store(true, Ordering::SeqCst);
-                                eprintln!("[capture] REMOTE ON (REL right edge)");
                             } else if !is_right && currently_remote {
                                 is_remote.store(false, Ordering::SeqCst);
-                                eprintln!("[capture] REMOTE OFF (REL left edge)");
+                                super::set_active_peer(None);
                             }
                         }
                         let remote_now = is_remote.load(Ordering::SeqCst);
                         if remote_now {
-                            match tx.blocking_send(NetworkEvent::MouseMoveRelative(value as f64, 0.0)) {
-                                Ok(()) => eprintln!("[capture] sent REL_X={}", value),
-                                Err(e) => eprintln!("[capture] REL_X send FAILED: {:?}", e),
-                            }
+                            let _ = tx.blocking_send(NetworkEvent::MouseMoveRelative(
+                                value as f64,
+                                0.0,
+                            ));
                         }
                     }
                     1 => {
                         let remote_now = is_remote.load(Ordering::SeqCst);
                         if remote_now {
                             match tx.blocking_send(NetworkEvent::MouseMoveRelative(0.0, value as f64)) {
-                                Ok(()) => eprintln!("[capture] sent REL_Y={}", value),
-                                Err(e) => eprintln!("[capture] REL_Y send FAILED: {:?}", e),
+                                Ok(()) => tracing::debug!("[capture] sent REL_Y={}", value),
+                                Err(e) => tracing::debug!("[capture] REL_Y send FAILED: {:?}", e),
                             }
+                        }
+                    }
+                    6 => {
+                        let remote_now = is_remote.load(Ordering::SeqCst);
+                        if remote_now {
+                            let _ = tx.blocking_send(NetworkEvent::MouseScroll(value, 0));
                         }
                     }
                     8 => {
                         let remote_now = is_remote.load(Ordering::SeqCst);
                         if remote_now {
-                            match tx.blocking_send(NetworkEvent::MouseScroll(0, value)) {
-                                Ok(()) => eprintln!("[capture] sent WHEEL={}", value),
-                                Err(e) => eprintln!("[capture] WHEEL send FAILED: {:?}", e),
-                            }
+                            let _ = tx.blocking_send(NetworkEvent::MouseScroll(0, value));
                         }
                     }
                     _ => {}
@@ -924,27 +1062,22 @@ pub mod os {
                         if !currently_remote && val >= screen_width - edge_threshold {
                             is_remote.store(true, Ordering::SeqCst);
                             edge.reset();
-                            eprintln!("[capture] REMOTE ON (ABS X {:.0})", val);
+                            tracing::debug!("[capture] REMOTE ON (ABS X {:.0})", val);
                         } else if currently_remote && val <= edge_threshold {
                             is_remote.store(false, Ordering::SeqCst);
                             edge.reset();
-                            eprintln!("[capture] REMOTE OFF (ABS X {:.0})", val);
+                            tracing::debug!("[capture] REMOTE OFF (ABS X {:.0})", val);
                         }
                         let remote_now = is_remote.load(Ordering::SeqCst);
                         if remote_now {
-                            match tx.blocking_send(NetworkEvent::MouseMoved(val, *last_abs_x)) {
-                                Ok(()) => eprintln!("[capture] sent ABS_X={:.0}", val),
-                                Err(e) => eprintln!("[capture] ABS_X send FAILED: {:?}", e),
-                            }
+                            let _ = tx.blocking_send(NetworkEvent::MouseMoved(val, *last_abs_y));
                         }
                     }
                     1 => {
+                        *last_abs_y = val;
                         let remote_now = is_remote.load(Ordering::SeqCst);
                         if remote_now {
-                            match tx.blocking_send(NetworkEvent::MouseMoved(*last_abs_x, val)) {
-                                Ok(()) => eprintln!("[capture] sent ABS_Y={:.0}", val),
-                                Err(e) => eprintln!("[capture] ABS_Y send FAILED: {:?}", e),
-                            }
+                            let _ = tx.blocking_send(NetworkEvent::MouseMoved(*last_abs_x, val));
                         }
                     }
                     _ => {}
@@ -955,20 +1088,24 @@ pub mod os {
                 let pressed = event.value() != 0;
                 let remote_now = is_remote.load(Ordering::SeqCst);
 
+                if let Some(kc) = evdev_key_to_keycode(key) {
+                    track_key(&kc, pressed);
+                }
                 if remote_now {
-                    if let Some(kc) = evdev_key_to_keycode(key) {
-                        eprintln!("[capture] key {:?} pressed={}", kc, pressed);
-                        if pressed {
-                            match tx.blocking_send(NetworkEvent::KeyDown(kc)) {
-                                Ok(()) => eprintln!("[capture] sent KeyDown"),
-                                Err(e) => eprintln!("[capture] KeyDown send FAILED: {:?}", e),
-                            }
+                    if let Some(btn) = evdev_btn_to_mousebutton(key) {
+                        let evt = if pressed {
+                            NetworkEvent::MouseButtonDown(btn)
                         } else {
-                            match tx.blocking_send(NetworkEvent::KeyUp(kc)) {
-                                Ok(()) => eprintln!("[capture] sent KeyUp"),
-                                Err(e) => eprintln!("[capture] KeyUp send FAILED: {:?}", e),
-                            }
-                        }
+                            NetworkEvent::MouseButtonUp(btn)
+                        };
+                        let _ = tx.blocking_send(evt);
+                    } else if let Some(kc) = evdev_key_to_keycode(key) {
+                        let evt = if pressed {
+                            NetworkEvent::KeyDown(kc)
+                        } else {
+                            NetworkEvent::KeyUp(kc)
+                        };
+                        let _ = tx.blocking_send(evt);
                     }
                 }
             }
@@ -979,18 +1116,18 @@ pub mod os {
 
     /// Start input simulation on Linux using uinput virtual devices.
     pub async fn start_simulation(mut rx: mpsc::Receiver<NetworkEvent>) {
-        eprintln!("[simulation] start_simulation called");
+        tracing::debug!("[simulation] start_simulation called");
         let mut uinput_dev = match create_uinput_device() {
             Some(d) => d,
             None => {
-                eprintln!("[simulation] FAILED to create uinput device — check /dev/uinput permissions!");
+                tracing::debug!("[simulation] FAILED to create uinput device — check /dev/uinput permissions!");
                 return;
             }
         };
-        eprintln!("[simulation] uinput device created, waiting for events...");
+        tracing::debug!("[simulation] uinput device created, waiting for events...");
 
         while let Some(event) = rx.recv().await {
-            eprintln!("[simulation] received: {:?}", event);
+            tracing::debug!("[simulation] received: {:?}", event);
             match event {
                 NetworkEvent::MouseMoved(x, y) => {
                     let _ = uinput_dev.emit(&[
@@ -1020,11 +1157,19 @@ pub mod os {
                         InputEvent::new(EventType::SYNCHRONIZATION, 0, 0),
                     ]);
                 }
-                NetworkEvent::MouseScroll(_dx, dy) => {
-                    let _ = uinput_dev.emit(&[
-                        InputEvent::new(EventType::RELATIVE, 8, dy),
-                        InputEvent::new(EventType::SYNCHRONIZATION, 0, 0),
-                    ]);
+                NetworkEvent::MouseScroll(dx, dy) => {
+                    if dx != 0 {
+                        let _ = uinput_dev.emit(&[
+                            InputEvent::new(EventType::RELATIVE, 6, dx),
+                            InputEvent::new(EventType::SYNCHRONIZATION, 0, 0),
+                        ]);
+                    }
+                    if dy != 0 {
+                        let _ = uinput_dev.emit(&[
+                            InputEvent::new(EventType::RELATIVE, 8, dy),
+                            InputEvent::new(EventType::SYNCHRONIZATION, 0, 0),
+                        ]);
+                    }
                 }
                 NetworkEvent::KeyDown(kc) => {
                     if let Some(ev) = keycode_to_evdev_key(&kc) {
@@ -1040,6 +1185,25 @@ pub mod os {
                             InputEvent::new(EventType::KEY, ev.code(), 0),
                             InputEvent::new(EventType::SYNCHRONIZATION, 0, 0),
                         ]);
+                    }
+                }
+                NetworkEvent::CursorWarp(x, y) => {
+                    super::warp_cursor(x, y);
+                }
+                NetworkEvent::RemoteEnter { from_edge, y_ratio } => {
+                    super::handle_remote_enter(from_edge, y_ratio);
+                }
+                NetworkEvent::RemoteLeave { .. } => {
+                    set_remote(true);
+                }
+                NetworkEvent::KeyStateSnapshot(keys) => {
+                    for kc in keys {
+                        if let Some(ev) = keycode_to_evdev_key(&kc) {
+                            let _ = uinput_dev.emit(&[
+                                InputEvent::new(EventType::KEY, ev.code(), 1),
+                                InputEvent::new(EventType::SYNCHRONIZATION, 0, 0),
+                            ]);
+                        }
                     }
                 }
                 _ => {}

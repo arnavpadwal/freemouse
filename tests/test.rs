@@ -73,6 +73,8 @@ fn network_event_all_variants_serialize() {
         NetworkEvent::KeyUp(KeyCode::Escape),
         NetworkEvent::ClipboardText("test".into()),
         NetworkEvent::KeepAlive,
+        NetworkEvent::AuthOk,
+        NetworkEvent::CursorWarp(1.0, 2.0),
     ];
     for event in events {
         let encoded = bincode::serialize(&event).unwrap();

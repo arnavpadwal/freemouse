@@ -16,7 +16,7 @@ pub fn start_clipboard_monitor(tx: tokio::sync::mpsc::Sender<NetworkEvent>) {
         let mut clipboard = match Clipboard::new() {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("Failed to init clipboard: {:?}", e);
+                tracing::debug!("Failed to init clipboard: {:?}", e);
                 return;
             }
         };
