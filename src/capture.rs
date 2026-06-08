@@ -555,7 +555,10 @@ pub mod os {
             KeyCode::End => Some(EnigoKey::End),
             KeyCode::Escape => Some(EnigoKey::Escape),
             KeyCode::Home => Some(EnigoKey::Home),
+            #[cfg(not(target_os = "macos"))]
             KeyCode::Insert => Some(EnigoKey::Insert),
+            #[cfg(target_os = "macos")]
+            KeyCode::Insert => None,
             KeyCode::LeftArrow => Some(EnigoKey::LeftArrow),
             KeyCode::PageDown => Some(EnigoKey::PageDown),
             KeyCode::PageUp => Some(EnigoKey::PageUp),
@@ -586,11 +589,17 @@ pub mod os {
             KeyCode::F18 => Some(EnigoKey::F18),
             KeyCode::F19 => Some(EnigoKey::F19),
             KeyCode::F20 => Some(EnigoKey::F20),
-            // F21-F24 are only on certain platforms
+            // F21-F24 are not available in enigo on macOS
+            #[cfg(not(target_os = "macos"))]
             KeyCode::F21 => Some(EnigoKey::F21),
+            #[cfg(not(target_os = "macos"))]
             KeyCode::F22 => Some(EnigoKey::F22),
+            #[cfg(not(target_os = "macos"))]
             KeyCode::F23 => Some(EnigoKey::F23),
+            #[cfg(not(target_os = "macos"))]
             KeyCode::F24 => Some(EnigoKey::F24),
+            #[cfg(target_os = "macos")]
+            KeyCode::F21 | KeyCode::F22 | KeyCode::F23 | KeyCode::F24 => None,
 
             // Numpad keys (use unicode for cross-platform compatibility)
             KeyCode::Numpad0 => Some(EnigoKey::Unicode('0')),
@@ -614,16 +623,28 @@ pub mod os {
             KeyCode::MediaNext => Some(EnigoKey::MediaNextTrack),
             KeyCode::MediaPrev => Some(EnigoKey::MediaPrevTrack),
             KeyCode::MediaPlayPause => Some(EnigoKey::MediaPlayPause),
+            #[cfg(not(target_os = "macos"))]
             KeyCode::MediaStop => Some(EnigoKey::MediaStop),
+            #[cfg(target_os = "macos")]
+            KeyCode::MediaStop => None,
             KeyCode::VolumeUp => Some(EnigoKey::VolumeUp),
             KeyCode::VolumeDown => Some(EnigoKey::VolumeDown),
             KeyCode::VolumeMute => Some(EnigoKey::VolumeMute),
 
-            // Other named keys
+            // Other named keys (Print/Pause/LMenu not in enigo on macOS)
+            #[cfg(not(target_os = "macos"))]
             KeyCode::PrintScreen => Some(EnigoKey::Print),
+            #[cfg(target_os = "macos")]
+            KeyCode::PrintScreen => None,
             KeyCode::ScrollLock => Some(EnigoKey::Other(71)),
+            #[cfg(not(target_os = "macos"))]
             KeyCode::Pause => Some(EnigoKey::Pause),
+            #[cfg(target_os = "macos")]
+            KeyCode::Pause => None,
+            #[cfg(not(target_os = "macos"))]
             KeyCode::Menu => Some(EnigoKey::LMenu),
+            #[cfg(target_os = "macos")]
+            KeyCode::Menu => None,
 
             // Direct Unicode passthrough
             KeyCode::Unicode(c) => Some(EnigoKey::Unicode(*c)),
